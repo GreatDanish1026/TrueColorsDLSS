@@ -160,6 +160,16 @@ inline bool HasModuleVtable(const uint8_t* base, const void* object) {
     return Contains(Sections(base, SectionKind::ReadOnly), vtable);
 }
 
+// The console manager's vtable may be a copy made by TrueColorsTweaks or TrueColorsDLSS (HookSinks):
+// it's accepted if its FindConsoleVariable slot points into the game's code.
+inline bool IsConsoleManager(const uint8_t* base, const void* object) {
+    const uint8_t* const* vtable = nullptr;
+    const uint8_t* fn = nullptr;
+    if (!object || !SafeCopy(&vtable, object, 8) || !vtable) return false;
+    if (!SafeCopy(&fn, reinterpret_cast<const uint8_t*>(vtable) + 0xb0, 8)) return false;
+    return Contains(Sections(base, SectionKind::Code), fn);
+}
+
 using FindFn = void*(__fastcall*)(void* self, const wchar_t* name, bool track);
 using PtrFn = void*(__fastcall*)(void* self);
 using IntFn = int32_t(__fastcall*)(void* self);

@@ -1056,7 +1056,7 @@ bool FindResolutionCvars() {
     void** singleton = cvars::FindConsoleManagerSingleton(base);
     void* manager = nullptr;
     if (singleton) cvars::SafeCopy(&manager, singleton, 8);
-    if (!manager || !cvars::HasModuleVtable(base, manager)) {
+    if (!manager || !cvars::IsConsoleManager(base, manager)) {
         g_res.error = "the game's console variables weren't found";
         return false;
     }
