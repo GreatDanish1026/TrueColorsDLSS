@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "dxbc.hpp"
 #include "version.h"
 #include "../third_party/reshade/utils/descriptor_tracking.hpp"
 
@@ -94,6 +95,11 @@ std::string Format(const char* fmt, ...) {
 
 std::mutex g_pipeMutex;
 std::unordered_map<uint64_t, uint32_t> g_pipeHash;  // pipeline handle -> FNV-1a of its compute shader
+// pipeline handle -> the registers its compute shader declares (DXBC: UE 4.25 ships SM5 bytecode
+// on D3D12). UE 4's descriptor tables are fixed-size, and slots a shader doesn't use still hold
+// old descriptors of resources that may be gone; describing those crashed the game (0.0.1,
+// GetDesc on a freed resource). The capture only resolves declared registers.
+std::unordered_map<uint64_t, ShaderDecl> g_pipeDecl;
 
 uint32_t Fnv(const void* data, size_t n) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -107,14 +113,23 @@ void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_sub
         if (subobjects[i].type != pipeline_subobject_type::compute_shader || !subobjects[i].data) continue;
         const shader_desc& s = *static_cast<const shader_desc*>(subobjects[i].data);
         if (!s.code || !s.code_size) continue;
+        const ShaderDecl decl = ParseDxbc(s.code, s.code_size);
         std::lock_guard<std::mutex> lock(g_pipeMutex);
         g_pipeHash[pipe.handle] = Fnv(s.code, s.code_size);
+        g_pipeDecl[pipe.handle] = decl;
     }
 }
 
 void OnDestroyPipeline(device*, pipeline pipe) {
     std::lock_guard<std::mutex> lock(g_pipeMutex);
     g_pipeHash.erase(pipe.handle);
+    g_pipeDecl.erase(pipe.handle);
+}
+
+ShaderDecl PipeDecl(uint64_t handle) {
+    std::lock_guard<std::mutex> lock(g_pipeMutex);
+    auto it = g_pipeDecl.find(handle);
+    return it == g_pipeDecl.end() ? ShaderDecl{} : it->second;
 }
 
 uint32_t PipeId(pipeline pipe) {
@@ -232,6 +247,7 @@ std::unordered_set<std::string> g_dumped;
 
 std::mutex g_capMutex;
 std::unordered_map<uint64_t, uint32_t> g_listPipe;  // command list -> compute shader id bound now
+std::unordered_map<uint64_t, uint64_t> g_listPipeHandle;  // command list -> compute pipeline bound now
 std::unordered_map<uint64_t, ListLog> g_lists;  // command list -> events since its reset
 std::vector<std::string> g_frame;                // executed lists in order, with frame boundaries
 std::unordered_map<uint64_t, uint64_t> g_listIds;
@@ -302,6 +318,7 @@ void OnBindPipeline(command_list* cl, pipeline_stage stages, pipeline pipe) {
     {
         std::lock_guard<std::mutex> lock(g_capMutex);
         g_listPipe[cl->get_native()] = id;
+        g_listPipeHandle[cl->get_native()] = pipe.handle;
     }
     Add(cl, Format("compute pipeline cs%08x%s", id, IsTsr(id) ? " (TSR)" : ""));
 }
@@ -433,6 +450,17 @@ char RegisterLetter(descriptor_type t) {
 // The resources in a TSR pass's descriptor tables, by shader register.
 void ResolveTables(command_list* cl, pipeline_layout layout, uint32_t first, uint32_t count, const descriptor_table* tables) {
     device* dev = cl->get_device();
+    uint64_t pipe = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_capMutex);
+        auto it = g_listPipeHandle.find(cl->get_native());
+        if (it != g_listPipeHandle.end()) pipe = it->second;
+    }
+    const ShaderDecl decl = PipeDecl(pipe);
+    if (!decl.valid) {
+        Add(cl, "  tables: shader declarations unknown (not DXBC); slots not resolved");
+        return;
+    }
     descriptor_tracking* dt = dev->get_private_data<descriptor_tracking>();
     if (!dt) return;
     for (uint32_t i = 0; i < count; ++i) {
@@ -450,6 +478,11 @@ void ResolveTables(command_list* cl, pipeline_layout layout, uint32_t first, uin
                 dev->get_descriptor_heap_offset(tables[i], range.binding + k, 0, &heap, &offset);
                 std::string what;
                 if (range.type == descriptor_type::sampler) continue;
+                const uint32_t reg = range.dx_register_index + k;
+                const bool declared = range.type == descriptor_type::constant_buffer ? decl.HasCb(reg)
+                                      : RegisterLetter(range.type) == 'u'          ? decl.HasUav(reg)
+                                                                                   : decl.HasSrv(reg);
+                if (!declared || range.dx_register_space != 0) continue;
                 if (range.type == descriptor_type::constant_buffer) {
                     const buffer_range b = dt->get_buffer_range(heap, offset);
                     if (!b.buffer.handle) continue;
