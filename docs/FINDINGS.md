@@ -87,9 +87,24 @@ hooked add-ons pin their DLL and only unhook when theirs is the vtable in place.
 2026-10-27 (0.2.2): Quality and Performance "looked good and acted as expected"; game exited
 cleanly.
 
-## 0.3.0: frame generation (untested)
+## 0.3.0: frame generation
 
 DoubleExposureDLSS's Streamline 2.14.16 DLSS-G code; Streamline told engine 4.25. No pre-HUD
 picture: the game draws its UI straight into the back buffer (`r.HDR.UI.CompositeMode=0`); the
 only back-buffer copy is a region copy right before Present (after the HUD). So frame generation
 runs without a hudless/UI mask, as ReunionDLSS does in SDR.
+
+User test 2026-10-27 (0.3.0, DLSS Quality + FG 2x): **"It looked and worked great"**. Log: Streamline
+started for the game's swapchain (swapchain created through Streamline's proxy, as in DE), View
+buffer check passed (projection 1.0000 / 1.7778, near 10), first frame tagged at submission, up to
+5 generated frames, Dynamic supported, Reflex available. Streamline's "failed to find global tag
+kBufferTypeDepth / MotionVectors" errors appear only on camera-cut frames (the game's TAA keeps
+those, so nothing is tagged); the game exited cleanly.
+
+## Not done / ideas
+
+- No pre-HUD picture for frame generation (UI drawn into the back buffer). Not needed so far.
+- Camera-cut frames: DLSS and frame generation skip them (velocity is a 1x1 placeholder). Camera-only
+  motion vectors there would keep DLSS on those frames too.
+- DLSS quality label: Performance is created as "Quality" (first NGX mode whose range holds the
+  render size); cosmetic, preset K is forced in every mode.
