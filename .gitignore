@@ -1,0 +1,8 @@
+bin/
+*.exe
+*.dll
+*.addon64
+*.log
+__pycache__/
+_downloads/
+third_party/streamline/bin/*.dll

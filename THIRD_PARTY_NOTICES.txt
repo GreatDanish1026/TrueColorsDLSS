@@ -1,0 +1,108 @@
+﻿Third-party notices
+===================
+
+DoubleExposureDLSS.addon64 is compiled against the following headers, which are
+included in the source repository under third_party/.
+
+----------------------------------------------------------------------------
+ReShade add-on API headers (third_party/reshade/include)
+https://github.com/crosire/reshade
+----------------------------------------------------------------------------
+Copyright 2014 Patrick Mours. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+  * Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+  * Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+----------------------------------------------------------------------------
+Dear ImGui headers (third_party/imgui)
+https://github.com/ocornut/imgui
+----------------------------------------------------------------------------
+The MIT License (MIT)
+
+Copyright (c) 2014-2025 Omar Cornut
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----------------------------------------------------------------------------
+ReShade descriptor tracking (third_party/reshade/utils)
+----------------------------------------------------------------------------
+From ReShade 6.8.0 examples/utils, Copyright (C) 2021 Patrick Mours,
+BSD-3-Clause OR MIT (see third_party/reshade/LICENSE.md). Modified (see the
+note at the top of descriptor_tracking.cpp).
+
+----------------------------------------------------------------------------
+NVIDIA DLSS SDK 310.9.16 (third_party/dlss)
+----------------------------------------------------------------------------
+Headers and nvsdk_ngx_s.lib from https://github.com/NVIDIA/DLSS (tag
+v310.9.16), under the NVIDIA RTX SDKs license (third_party/dlss/LICENSE.txt).
+This software contains source code provided by NVIDIA Corporation.
+
+
+----------------------------------------------------------------------------
+NVIDIA Streamline SDK 2.14.16 (third_party/streamline)
+https://github.com/NVIDIA-RTX/Streamline
+----------------------------------------------------------------------------
+Headers from the SDK release (tag v2.14.16).
+
+The DoubleExposureDLSS release zip redistributes NVIDIA-signed runtime files from that
+same release, unmodified: nvngx_dlss.dll (DLSS 310.9.16) and, in the streamline
+folder, sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll,
+sl.pcl.dll and nvngx_dlssg.dll. Their licences are in the zip's licenses folder:
+Streamline-LICENSE.txt (below), NVIDIA-DLSS-LICENSE.txt and
+NVIDIA-Reflex-LICENSE.txt. They are not part of the source repository.
+
+/*
+* Copyright (c) 2023 NVIDIA CORPORATION. All rights reserved
+*
+* Permission is hereby granted, free of charge, to any person obtaining a copy
+* of this software and associated documentation files (the "Software"), to deal
+* in the Software without restriction, including without limitation the rights
+* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+* copies of the Software, and to permit persons to whom the Software is
+* furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in all
+* copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+* SOFTWARE.
+*/
+
+/*
+*  NSight Perf SDK License, Version 2023.3
+*  Please see the file included in this package
+*  "NVIDIA Nsight Perf SDK License (28Sept2022).pdf" for licensing details
+*  of the NSight Perf SDK.
+*  NSight Perf SDK ver 2023.3 can be downloaded from here:
+*  https://developer.nvidia.com/gameworksdownload#?dn=nsight-perf-sdk-2023-3
+*  The Streamline files covered by the NSight Perf SDK License are:
+*  sl_nvperf.h
+*  sl_nvperf.dll
+*/
