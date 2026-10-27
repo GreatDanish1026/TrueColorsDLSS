@@ -69,3 +69,27 @@ UE 4.25's (0 / 64 / 256 / 448 / 512).
 Render resolution: only the game's (100%, so DLSS runs as DLAA). Lower DLSS modes need
 `r.ScreenPercentage` < 100 with `r.TemporalAA.Upsampling=1` (a different TAA permutation, so a
 different shader id) and setting cvars on the game thread (UE 4).
+
+User test 2026-10-27: **0.1.0 DLAA "looks really good"**; every gameplay frame went through DLSS
+(log: 120 of 120 per diag window), camera-cut frames (1x1 placeholder velocity, format 90) stay
+with the game's TAA.
+
+## 0.2.x: render resolutions
+
+DLSS modes set `r.ScreenPercentage` and `r.TemporalAA.Upsampling=1` on the game thread (cvars.hpp
+from TrueColorsTweaks: a vtable copy of the console manager with CallAllConsoleVariableSinks
+hooked) and give both back with the game's priorities. With TAAU the TAA is another permutation:
+**`cs352b453c`** (Quality: colour 2564x1444 texture, view 2561x1441 -> 3840x2160), found by its
+declared registers (exactly t0-t5 and u0) and binding shapes. Both add-ons hook the same slot:
+0.2.1 accepts a manager whose vtable is the other add-on's copy (FindConsoleVariable slot in the
+game's code), 0.2.2 copies a vtable whose hooked slot points outside the exe (executable memory);
+hooked add-ons pin their DLL and only unhook when theirs is the vtable in place. User test
+2026-10-27 (0.2.2): Quality and Performance "looked good and acted as expected"; game exited
+cleanly.
+
+## 0.3.0: frame generation (untested)
+
+DoubleExposureDLSS's Streamline 2.14.16 DLSS-G code; Streamline told engine 4.25. No pre-HUD
+picture: the game draws its UI straight into the back buffer (`r.HDR.UI.CompositeMode=0`); the
+only back-buffer copy is a region copy right before Present (after the HUD). So frame generation
+runs without a hudless/UI mask, as ReunionDLSS does in SDR.

@@ -615,7 +615,7 @@ bool InitStreamline(ID3D12Device* device, std::string& error) {
     pref.featuresToLoad = features;
     pref.numFeaturesToLoad = 3;
     pref.engine = sl::EngineType::eUnreal;
-    pref.engineVersion = "5.6";
+    pref.engineVersion = "4.25";
     pref.projectId = kProjectId;
     pref.renderAPI = sl::RenderAPI::eD3D12;
     sl::Result r = g_sl.init(pref, sl::kSDKVersion);
