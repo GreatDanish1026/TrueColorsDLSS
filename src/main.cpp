@@ -677,6 +677,11 @@ const std::wstring& ExeDir() { return g_exeDir; }
 
 uint32_t PipeId(pipeline pipe) { return ::PipeId(pipe); }
 
+bool PipeHasTaaRegisters(pipeline pipe) {
+    const ShaderDecl d = PipeDecl(pipe.handle);
+    return d.valid && d.srv[0] == 0x3f && d.srv[1] == 0 && d.uav == 1;
+}
+
 }  // namespace rd
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {

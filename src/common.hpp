@@ -24,6 +24,10 @@ const std::wstring& ExeDir();
 
 // FNV-1a of a compute pipeline's shader bytecode (0 if unknown): stable across runs.
 uint32_t PipeId(reshade::api::pipeline pipe);
+// True if the compute shader declares exactly t0-t5 and u0 (DXBC), the TAA's registers: only then
+// are its bindings read to check whether it's a TAA permutation (undeclared slots can hold
+// descriptors of freed resources).
+bool PipeHasTaaRegisters(reshade::api::pipeline pipe);
 
 // The upscaler's compute shaders. True Colors (UE 4.25) upscales with TAA/TAAU, not TSR, so
 // these are placeholders until a frame capture maps the passes (docs/FINDINGS.md); while

@@ -10,8 +10,11 @@
 // The game's TAA dispatch is then skipped. Its output is also its history for the next frame
 // (and the post-processing reads it), so DLSS's result serves both.
 //
-// This version runs at the game's resolution (DLAA): render resolutions below 100% need UE's TAAU
-// permutation and setting cvars on the game thread, not done yet.
+// Render resolution: a DLSS mode sets r.ScreenPercentage and r.TemporalAA.Upsampling=1 (UE 4's
+// TAAU: the TAA then takes the render-size image and writes the full-size output) on the game
+// thread, and gives both back when DLSS goes off. TAAU is another permutation of the TAA shader
+// (another id): shaders declaring exactly the TAA's registers are checked once by their bindings
+// and taken as TAA if they match (IsTaa).
 //
 // The TSR code from DoubleExposureDLSS (DilateVelocity chain, translucency blend) is still here
 // but nothing calls it in this game.
@@ -83,7 +86,7 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "TranslucencyMask", g_set.transMask);
     if (g_set.transMask < 0 || g_set.transMask >= kTransMaskCount) g_set.transMask = 1;
     if (!kTsrMapped) g_set.enabled = false;  // the upscaler's passes aren't known in this game yet
-    g_set.mode = 0;  // this version: the game's resolution only (DLAA at 100%)
+    if (g_set.mode < 0 || g_set.mode >= 6) g_set.mode = 0;
 }
 
 void SaveSettings() {
@@ -908,13 +911,44 @@ bool OnTaa(command_list* cl, ListState& s) {
     return true;  // DLSS wrote the TAA's output: skip the game's dispatch
 }
 
+// Whether the bound compute shader is a TAA permutation: the known one, or one declaring the TAA's
+// registers with its binding shapes (1x1 exposure, HDR colour, depth, rg16 velocity, HDR history
+// and output). Checked once per shader id; logged.
+bool IsTaa(command_list* cl, ListState& s) {
+    if (s.computeId == kTaaMain) return true;
+    if (!s.computeId) return false;
+    static std::map<uint32_t, bool> verdict;
+    auto it = verdict.find(s.computeId);
+    if (it != verdict.end()) return it->second;
+    if (!PipeHasTaaRegisters(s.pipe)) return verdict[s.computeId] = false;
+    device* dev = cl->get_device();
+    resource r[6];
+    for (uint32_t i = 0; i < 6; ++i) r[i] = Bound(cl, s.compute, 0, i);
+    const resource out = Bound(cl, s.compute, 2, 0);
+    for (const resource& x : r)
+        if (!x.handle) return false;  // not decided: try again at its next dispatch
+    if (!out.handle) return false;
+    resource_desc d[6];
+    for (uint32_t i = 0; i < 6; ++i) d[i] = dev->get_resource_desc(r[i]);
+    const resource_desc od = dev->get_resource_desc(out);
+    const bool match = d[0].texture.width == 1 && d[0].texture.height == 1 && IsHdrColor(d[1].texture.format) &&
+                       d[2].texture.format == format::r32_g8_typeless && d[3].texture.format == format::r16g16_unorm &&
+                       IsHdrColor(d[5].texture.format) && IsHdrColor(od.texture.format) &&
+                       od.texture.width >= d[1].texture.width && od.texture.height >= d[1].texture.height;
+    if (verdict.size() < 256) verdict[s.computeId] = match;
+    if (match)
+        Log("TAA permutation cs%08x taken (colour %ux%u -> output %ux%u)", s.computeId, d[1].texture.width,
+            d[1].texture.height, od.texture.width, od.texture.height);
+    return match;
+}
+
 bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
     if (!g_set.enabled) return false;
     ListState* s = State(cl);
     if (!s) return false;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     (void)x, (void)y, (void)z;
-    return s->computeId == kTaaMain && OnTaa(cl, *s);
+    return IsTaa(cl, *s) && OnTaa(cl, *s);
 }
 
 void OnDestroyDevice(device* dev) {
@@ -938,28 +972,86 @@ bool g_keyWasDown = false;
 
 // ---------------------------------------------------------------- render resolution (DLSS mode)
 //
-// DLSS renders at the game's r.ScreenPercentage (the menu's Resolution Scale). A DLSS mode sets
-// it to NVIDIA's ratio for that mode while DLSS is on, and puts the game's value back when DLSS is
-// off (so TSR gets the menu's). The game sets it again when its menu is applied: that value is
-// remembered as the game's and the mode's put back.
+// DLSS renders at r.ScreenPercentage. A DLSS mode sets it to NVIDIA's ratio for that mode, with
+// r.TemporalAA.Upsampling=1 so UE's TAA (which DLSS replaces) takes the render-size image and
+// writes the full-size output, while DLSS is on; both go back to the game's values and priorities
+// when DLSS is off. In UE 4 a cvar change only reaches the renderer when it's set on the game
+// thread, so the setting happens in the console manager's CallAllConsoleVariableSinks, called
+// once per frame by FEngineLoop::Tick (cvars.hpp HookSinks, as in TrueColorsTweaks; the two
+// add-ons' hooks chain). The present thread only says what it wants (g_res.want).
 
 enum DlssMode { kModeGame, kModeDlaa, kModeQuality, kModeBalanced, kModePerformance, kModeUltraPerformance, kDlssModeCount };
-const char* const kDlssModeNames[kDlssModeCount] = {"Game's Resolution Scale", "DLAA (100%)", "Quality (67%)",
+const char* const kDlssModeNames[kDlssModeCount] = {"Game's (100%)", "DLAA (100%)", "Quality (67%)",
                                                     "Balanced (58%)", "Performance (50%)", "Ultra Performance (33%)"};
 const float kDlssModePercent[kDlssModeCount] = {0, 100, 66.667f, 58, 50, 33.333f};
 
 struct Resolution {
     void* manager = nullptr;
-    void* var = nullptr;  // r.ScreenPercentage
-    int sinkFlag = -1;
-    bool failed = false;
+    void* screen = nullptr;  // r.ScreenPercentage
+    void* upsample = nullptr;  // r.TemporalAA.Upsampling
+    bool failed = false, hooked = false;
+    std::atomic<float> want{0};  // render percentage wanted (0: the game's)
+    // game thread:
     bool overriding = false;
-    float gameValue = 0, ourValue = 0;
-    uint64_t presents = 0;
+    float gameScreen = 100, ourScreen = 0;
+    int gameUpsample = 0;
+    uint32_t gameScreenPriority = 0, gameUpsamplePriority = 0;
+    uint64_t ticks = 0;
     std::string error;
 } g_res;
 
-bool FindScreenPercentage() {
+cvars::SinksFn g_origSinks = nullptr;
+
+bool SetFloat(void* var, float v) {
+    wchar_t text[32];
+    swprintf(text, 32, L"%.3f", v);
+    return cvars::Set(var, text);
+}
+
+// Game thread, about every 15 frames.
+void ResolutionTick() {
+    if (++g_res.ticks % 15 != 0) return;
+    const float want = g_res.want.load();
+    float now = 0;
+    int32_t up = 0;
+    if (!cvars::GetFloat(g_res.screen, now) || !cvars::GetInt(g_res.upsample, up)) return;
+    if (want > 0) {
+        if (!g_res.overriding) {
+            g_res.gameScreen = now, g_res.gameUpsample = up;
+            g_res.gameScreenPriority = cvars::GetFlags(g_res.screen) & cvars::kPriorityMask;
+            g_res.gameUpsamplePriority = cvars::GetFlags(g_res.upsample) & cvars::kPriorityMask;
+            g_res.overriding = true;
+        } else if (std::fabs(now - g_res.ourScreen) > 0.01f && std::fabs(now - want) > 0.01f) {
+            g_res.gameScreen = now;  // the game set it again (menu, resolution change)
+            Log("DLSS mode: the game set its screen percentage to %g%%", now);
+        }
+        if (std::fabs(now - want) > 0.01f) {
+            const bool ok = SetFloat(g_res.screen, want);
+            g_res.ourScreen = want;
+            Log("DLSS mode: render resolution %g%% %s (the game's: %g%%)", want, ok ? "set" : "NOT set", g_res.gameScreen);
+        }
+        if (up != 1) cvars::Set(g_res.upsample, L"1");
+    } else if (g_res.overriding) {
+        g_res.overriding = false;
+        if (std::fabs(now - g_res.ourScreen) < 0.01f) {
+            SetFloat(g_res.screen, g_res.gameScreen);
+            cvars::RestorePriority(g_res.screen, g_res.gameScreenPriority);
+        }
+        wchar_t text[16];
+        swprintf(text, 16, L"%d", g_res.gameUpsample);
+        cvars::Set(g_res.upsample, text);
+        cvars::RestorePriority(g_res.upsample, g_res.gameUpsamplePriority);
+        Log("DLSS mode: back to the game's screen percentage (%g%%) and TAA upsampling (%d)", g_res.gameScreen,
+            g_res.gameUpsample);
+    }
+}
+
+void __fastcall HookedSinks(void* self) {
+    ResolutionTick();
+    g_origSinks(self);
+}
+
+bool FindResolutionCvars() {
     const uint8_t* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
     void** singleton = cvars::FindConsoleManagerSingleton(base);
     void* manager = nullptr;
@@ -970,43 +1062,30 @@ bool FindScreenPercentage() {
     }
     void* aniso = cvars::FindVariable(manager, L"r.MaxAnisotropy");
     void* screen = cvars::FindVariable(manager, L"r.ScreenPercentage");
+    void* upsample = cvars::FindVariable(manager, L"r.TemporalAA.Upsampling");
     float value = -1;
-    if (!aniso || !screen || !cvars::HasModuleVtable(base, screen) || !cvars::FindTypeSlots(aniso, screen) ||
+    if (!aniso || !screen || !upsample || !cvars::HasModuleVtable(base, screen) || !cvars::FindTypeSlots(aniso, screen) ||
         !cvars::GetFloat(screen, value) || !(value >= 10 && value <= 400)) {
         g_res.error = "r.ScreenPercentage didn't look right (see the log)";
-        Log("DLSS mode: r.ScreenPercentage %p reads %g: not used", screen, value);
+        Log("DLSS mode: r.ScreenPercentage %p reads %g, r.TemporalAA.Upsampling %p: not used", screen, value, upsample);
         return false;
     }
-    g_res.manager = manager, g_res.var = screen;
-    g_res.sinkFlag = cvars::FindSinkFlagOffset(manager);
-    Log("DLSS mode: r.ScreenPercentage found (now %g)", value);
-    return true;
-}
-
-bool SetScreenPercentage(float v) {
-    wchar_t text[32];
-    swprintf(text, 32, L"%.3f", v);
-    if (!cvars::Set(g_res.var, text)) return false;
-    // UE 5.2 only copies a value to the render thread on the game thread (cvars.hpp).
-    cvars::MirrorToRenderer(reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr)), g_res.var,
-                            cvars::GetType(g_res.var));
-    if (g_res.sinkFlag >= 0) cvars::RequestSinks(g_res.manager, g_res.sinkFlag);
-    g_res.ourValue = v;
+    g_res.manager = manager, g_res.screen = screen, g_res.upsample = upsample;
+    if (!cvars::HookSinks(base, manager, &HookedSinks, &g_origSinks)) {
+        g_res.error = "couldn't reach the game thread";
+        Log("DLSS mode: game-thread hook failed");
+        return false;
+    }
+    g_res.hooked = true;
+    Log("DLSS mode: r.ScreenPercentage found (now %g); game-thread hook in place", value);
     return true;
 }
 
 // ---------------------------------------------------------------- velocity settings (logged)
-//
-// Logged once for diagnosis. 0.1.1 also set r.Velocity.EnableVertexDeformation=1 while DLSS was
-// on: changing it makes the engine recreate every primitive's render state, which must happen on
-// the game thread, and doing it from ReShade's thread hung the game (2026-10-26). It was already
-// 2 (auto: on while TSR is the anti-aliasing method, which it stays under DLSS), so it isn't
-// changed any more.
 
-const wchar_t* const kVelocityLogged[] = {L"r.Velocity.EnableVertexDeformation", L"r.VertexDeformationOutputsVelocity",
-                                          L"r.BasePassOutputsVelocity",          L"r.Velocity.ForceOutput",
-                                          L"r.VelocityOutputPass",               L"r.SkinCache.Mode",
-                                          L"r.SkinCache.Allow",                  L"r.HairStrands.VelocityType"};
+const wchar_t* const kVelocityLogged[] = {L"r.BasePassOutputsVelocity", L"r.SkinCache.Mode",
+                                          L"r.TemporalAA.Upsampling", L"r.ScreenPercentage",
+                                          L"r.TemporalAASamples", L"r.TemporalAACurrentFrameWeight"};
 bool g_velocityLogged = false;
 
 void LogVelocitySettings() {
@@ -1015,45 +1094,23 @@ void LogVelocitySettings() {
     for (const wchar_t* name : kVelocityLogged) {
         void* var = cvars::FindVariable(g_res.manager, name);
         if (!var) {
-            Log("velocity: %ls not found", name);
+            Log("cvar: %ls not found", name);
             continue;
         }
         wchar_t buf[64] = L"?";
         cvars::GetText(var, cvars::GetType(var), buf, 64);
-        Log("velocity: %ls = %ls (%s, set by 0x%02x)", name, buf, cvars::TypeName(cvars::GetType(var)), cvars::Priority(var));
+        Log("cvar: %ls = %ls (%s, set by 0x%02x)", name, buf, cvars::TypeName(cvars::GetType(var)), cvars::Priority(var));
     }
 }
 
-// About twice a second, on ReShade's present.
+// About twice a second, on ReShade's present: what the game thread should hold.
 void UpdateResolution() {
-    if (++g_res.presents % 30 != 0) return;
-    if (g_set.enabled && !g_res.manager && !g_res.failed && !FindScreenPercentage()) g_res.failed = true;
-    LogVelocitySettings();
+    static uint64_t presents = 0;
+    if (++presents % 30 != 0) return;
     const bool want = g_set.enabled && g_set.mode > kModeGame && g_set.mode < kDlssModeCount;
-    if (!g_res.var) {
-        if (!want || g_res.failed) return;
-        if (!FindScreenPercentage()) {
-            g_res.failed = true;
-            return;
-        }
-    }
-    float now = 0;
-    if (!cvars::GetFloat(g_res.var, now)) return;
-    if (want) {
-        const float target = kDlssModePercent[g_set.mode];
-        if (!g_res.overriding) {
-            g_res.gameValue = now, g_res.overriding = true;
-        } else if (std::fabs(now - g_res.ourValue) > 0.01f) {
-            g_res.gameValue = now;  // the game's menu set it again
-            Log("DLSS mode: the game set its resolution scale to %g%%", now);
-        }
-        if (std::fabs(now - target) > 0.01f && SetScreenPercentage(target))
-            Log("DLSS mode %s: render resolution %g%% (the game's: %g%%)", kDlssModeNames[g_set.mode], target, g_res.gameValue);
-    } else if (g_res.overriding) {
-        g_res.overriding = false;
-        if (std::fabs(now - g_res.ourValue) < 0.01f && SetScreenPercentage(g_res.gameValue))
-            Log("DLSS mode: back to the game's resolution scale (%g%%)", g_res.gameValue);
-    }
+    if (!g_res.manager && !g_res.failed && (want || g_set.enabled) && !FindResolutionCvars()) g_res.failed = true;
+    LogVelocitySettings();
+    g_res.want = want ? kDlssModePercent[g_set.mode] : 0.0f;
 }
 
 void LogStats() {
@@ -1124,6 +1181,7 @@ void RegisterUpscaler() {
 }
 
 void UnregisterUpscaler() {
+    if (g_res.hooked) cvars::UnhookSinks(g_res.manager), g_res.hooked = false;
     reshade::unregister_event<reshade::addon_event::init_command_list>(&OnInitList);
     reshade::unregister_event<reshade::addon_event::destroy_command_list>(&OnDestroyList);
     reshade::unregister_event<reshade::addon_event::reset_command_list>(&OnResetList);
@@ -1162,7 +1220,12 @@ void DrawUpscalerSettings() {
     if (ImGui::Checkbox("DLSS (F9)", &g_set.enabled)) SaveAndLog();
     ImGui::EndDisabled();
     Help("NVIDIA DLSS in place of the game's TAA anti-aliasing. F9 switches it on and off while playing, to compare.");
-    ImGui::TextDisabled("Render resolution: the game's (DLAA at 100%%); lower DLSS modes come in a later version.");
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Render resolution", &g_set.mode, kDlssModeNames, kDlssModeCount)) SaveAndLog();
+    Help("The resolution DLSS renders at, as a share of the screen's. The game itself renders at 100%, so\n"
+         "\"Game's\" and DLAA are the same (best image, no speed-up). Quality, Balanced and Performance render\n"
+         "fewer pixels and let DLSS rebuild the full image: faster. The game's values come back when DLSS is off.");
+    if (g_res.failed) ImGui::TextColored(kWarn, "Render resolution: %s", g_res.error.c_str());
 
     int cur = 2;
     for (int i = 0; i < kPresetCount; ++i)
@@ -1220,8 +1283,8 @@ void DrawUpscalerStatus() {
         if (g_motion.composed || g_motion.copied)
             ImGui::TextDisabled("Translucency: %s", g_motion.composed ? "blended into DLSS's input"
                                                                       : "not found (colour copied without it)");
-        if (g_res.var)
-            ImGui::TextDisabled("Resolution scale: %s", g_res.overriding ? "set by the Render resolution choice" : "the game's");
+        if (g_res.hooked)
+            ImGui::TextDisabled("Screen percentage: %s", g_res.want.load() > 0 ? "set by the Render resolution choice" : "the game's");
     }
 }
 

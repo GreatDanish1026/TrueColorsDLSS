@@ -1,34 +1,36 @@
-// Finds Unreal console variables in the running game and reads and sets them. Adapted from
-// ReunionTweaks (UE 5.6) and AITDTweaks (UE 4.27) for Life is Strange: True Colors
-// (UE 5.2.1, project Chronos, no PDB). Offsets were read from Chronos-Win64-Shipping.exe
-// (docs/FINDINGS.md).
+// Finds Unreal console variables in the running game and reads and sets them, for Life is
+// Strange: True Colors (UE 4.25Plus, project Siren, no PDB). The scanner comes from
+// DoubleExposureTweaks; the game-thread setting from FrankStoneTweaks. Offsets were read from
+// Siren-Win64-Shipping.exe's own call sites (docs/FINDINGS.md).
 //
-// The exe isn't protected, but sections are still picked by their flags (as in ReunionTweaks):
-// code = executable and not writable; read-only data = readable, not executable, not writable.
+// The exe isn't protected; sections are still picked by their flags: code = executable and not
+// writable; read-only data = readable, not executable, not writable.
 //
 // IConsoleManager::Singleton is found from the game's own code: cvar lookups load it with
 // `mov rcx, [rip+Singleton]` shortly before `lea rdx, [rip+L"r.ScreenPercentage"]`. The address
-// most matches agree on wins.
+// most matches agree on wins (RVA 0x492a1f0 in build 8050014).
 //
-// Vtable offsets. UE 5.2 keeps UE 4.27's IConsoleVariable layout; only FindConsoleVariable
-// moved (0xb0 in 4.27, 0xb8 here, as in 5.5):
-//   IConsoleManager  +0xb8  FindConsoleVariable(const TCHAR* Name, bool bTrackFrequentCalls)
-//                    +0x50  CallAllConsoleVariableSinks
+// Vtable offsets (UE 4.25, same as 4.26/4.27):
+//   IConsoleManager  +0x50  CallAllConsoleVariableSinks (6 call sites; +0x58 registers a sink)
+//                    +0xb0  FindConsoleVariable(const TCHAR* Name, bool bTrackFrequentCalls)
 //   IConsoleObject   +0x18 flags field (not a slot; top byte = SetBy priority)
-//                    IsVariableBool/Int/Float/String: found per game by reading their code
-//                    (FindTypeSlots); expected at 0x30-0x48. AsVariableBool/Int/Float follow
-//                    0x20 later (AsVariableInt +0x58: 536 call sites).
+//                    IsVariableBool/Int/Float/String: found by reading their code
+//                    (FindTypeSlots); AsVariableBool/Int/Float follow 0x20 later
+//                    (AsVariableInt +0x58: about 3000 call sites).
 //   IConsoleVariable +0x80 Set(const TCHAR* Value, EConsoleVariableFlags SetBy)
-//                    +0x88 GetBool  +0x90 GetInt  +0x98 GetFloat
+//                    +0x88 GetBool  +0x90 GetInt  +0x98 GetFloat  +0xa0 GetString
 //
-// Setting from ReShade's thread: UE 5.2 has no ECVF_Set_SetOnly_Unsafe, so (as in the UE 4
-// add-ons) Set runs normally, and because OnCVarChange only copies the value to the render
-// thread's shadow on the game thread, MirrorToRenderer does that copy afterwards.
+// Priority: the game's code sets at 0x08000000 (SetByCode) and the console at 0x09000000
+// (SetByConsole, the highest value passed to Set anywhere in the exe). The add-on sets at
+// SetByConsole, so the menu can't override a held value; letting go puts the game's value and
+// priority back.
 //
-// Priority: the game's own code sets at 0x09000000 (SetByCode, 51 call sites) and the console at
-// 0x0A000000 (SetByConsole, the highest value passed anywhere in the exe). The add-on sets at
-// SetByConsole, so the menu can't override a held value; values go back to the game's value at
-// the same priority.
+// Threads: in UE 4 a Set reaches the renderer only when it runs on the game thread
+// (OnCVarChange enqueues the render-thread copy there), and some change callbacks flush
+// rendering, which hangs when called from the render or present thread (Jedi Survivor,
+// r.MaxAnisotropy). So every Set runs on the game thread: the add-on calls it from its own
+// CallAllConsoleVariableSinks (HookSinks below), which FEngineLoop::Tick calls once per frame.
+// Off the game thread the getters return the renderer's copy.
 #pragma once
 
 #define WIN32_LEAN_AND_MEAN
@@ -42,13 +44,15 @@
 
 namespace cvars {
 
-constexpr uint32_t kFindConsoleVariable = 0xb0;  // UE 4.25 (True Colors)
+constexpr uint32_t kFindConsoleVariable = 0xb0;
 constexpr uint32_t kCallAllConsoleVariableSinks = 0x50;
 constexpr uint32_t kSet = 0x80;
 constexpr uint32_t kGetInt = 0x90;
 constexpr uint32_t kGetFloat = 0x98;
 constexpr uint32_t kFlags = 0x18;
-constexpr uint32_t kSetByConsole = 0x0a000000;
+constexpr uint32_t kSetByCode = 0x08000000;
+constexpr uint32_t kSetByConsole = 0x09000000;
+constexpr uint32_t kPriorityMask = 0xff000000;
 
 // IsVariableBool's slot; Int, Float and String follow it, then AsVariableBool/Int/Float.
 // Set by FindTypeSlots.
@@ -286,17 +290,23 @@ inline int Priority(void* var) {
     return static_cast<int>(flags >> 24);
 }
 
-// ---------------------------------------------------------------- render thread copy
-//
-// Data cvars (FConsoleVariable<T>) hold TConsoleVariableData<T>: the game thread's value, then
-// the render thread's copy right after it (+4 for int and float, +1 for bool). AsVariable*
-// returns it; it lies inside the cvar object.
-//
-// Ref cvars (FConsoleVariableRef<T>, AsVariable* returns null) hold a pointer to the engine
-// global the renderer reads and, right after it, their own value. The value's offset is read
-// from the getter's code (mov eax, [rcx+X] / movzx eax, byte [rcx+X] / movss xmm0, [rcx+X]),
-// and the pointer must point into the module's writable data.
+// The flags word (top byte: priority of the last accepted Set), or 0 if unreadable.
+inline uint32_t GetFlags(void* var) {
+    uint32_t f = 0;
+    SafeCopy(&f, static_cast<uint8_t*>(var) + kFlags, 4);
+    return f;
+}
 
+// Puts the priority byte back to <priority> (the game's, when we let go of a variable), so the
+// game's menu can set it again. Only the top byte changes.
+inline bool RestorePriority(void* var, uint32_t priority) {
+    uint32_t f = GetFlags(var);
+    f = (f & ~kPriorityMask) | (priority & kPriorityMask);
+    return SafeCopy(static_cast<uint8_t*>(var) + kFlags, &f, 4);
+}
+
+// Data cvars return their TConsoleVariableData from AsVariable*; Ref cvars (pointing at an
+// engine global) return null. Logged only, to see the layout.
 inline void* AsData(void* var, Type t) {
     if (!g_isVariableBool || (t != Type::Bool && t != Type::Int && t != Type::Float)) return nullptr;
     const uint32_t slot = g_isVariableBool + 0x20 + (t == Type::Bool ? 0 : t == Type::Int ? 8 : 0x10);
@@ -306,103 +316,65 @@ inline void* AsData(void* var, Type t) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
     }
-    // Must be inside the object, past the flags.
     auto p = static_cast<uint8_t*>(out), v = static_cast<uint8_t*>(var);
     return out && p > v + kFlags && p < v + 0x200 ? out : nullptr;
 }
 
-// The Ref cvar's own value offset, read from its getter's code, or -1.
-inline int RefValueOffset(void* var, Type t) {
-    const uint8_t* fn = SlotCode(var, t == Type::Float ? kGetFloat : kGetInt);
-    uint8_t b[7];
-    if (!fn || !SafeCopy(b, fn, 7)) return -1;
-    if (t == Type::Int && b[0] == 0x8b && b[1] == 0x41 && b[3] == 0xc3) return b[2];
-    if (t == Type::Bool && b[0] == 0x0f && b[1] == 0xb6 && b[2] == 0x41 && b[4] == 0xc3) return b[3];
-    if (t == Type::Float && b[0] == 0xf3 && b[1] == 0x0f && b[2] == 0x10 && b[3] == 0x41 && b[5] == 0xc3) return b[4];
-    return -1;
-}
-
-enum class Mirror { Data, Ref, NotNumeric, Unknown };
-
-inline const char* MirrorName(Mirror m) {
-    switch (m) {
-        case Mirror::Data: return "data";
-        case Mirror::Ref: return "ref";
-        case Mirror::NotNumeric: return "not numeric";
-        default: return "unknown layout";
-    }
-}
-
-// Copies the main value to where the renderer reads it (what OnCVarChange does on the game
-// thread). Aligned stores, so the render thread sees old or new, never a mix.
-inline Mirror MirrorToRenderer(const uint8_t* base, void* var, Type t) {
-    if (t != Type::Bool && t != Type::Int && t != Type::Float) return Mirror::NotNumeric;
-    const size_t size = t == Type::Bool ? 1 : 4;
-    uint8_t value[4];
-    if (void* data = AsData(var, t))
-        return SafeCopy(value, data, size) && SafeCopy(static_cast<uint8_t*>(data) + size, value, size) ? Mirror::Data
-                                                                                                         : Mirror::Unknown;
-    const int off = RefValueOffset(var, t);
-    if (off < 0x20) return Mirror::Unknown;
-    uint8_t* global = nullptr;
-    auto obj = static_cast<uint8_t*>(var);
-    if (!SafeCopy(&global, obj + off - 8, 8) || !Contains(Sections(base, SectionKind::Writable), global))
-        return Mirror::Unknown;
-    return SafeCopy(value, obj + off, size) && SafeCopy(global, value, size) ? Mirror::Ref : Mirror::Unknown;
-}
-
-// ---------------------------------------------------------------- sinks
-//
-// Some settings only reach the engine through a console variable sink. The game thread calls
-// IConsoleManager::CallAllConsoleVariableSinks every tick, and it runs the sinks when
-// FConsoleManager::bCallAllConsoleVariableSinks is set, then clears it. Setting that flag from
-// any thread is safe; the sinks then run on the game thread. Its offset is read from the
-// function's first instructions: cmp byte ptr [rcx+offset], 0.
-inline int FindSinkFlagOffset(void* manager) {
-    const uint8_t* fn = SlotCode(manager, kCallAllConsoleVariableSinks);
-    uint8_t b[40];
-    if (!fn || !SafeCopy(b, fn, sizeof(b))) return -1;
-    for (int i = 0; i < 32; ++i) {
-        const uint8_t* p = b + i;
-        if (p[0] != 0x80) continue;
-        if ((p[1] == 0x79 || p[1] == 0x7b) && p[3] == 0) return p[2];  // cmp byte [rcx/rbx+disp8], 0
-        if ((p[1] == 0xb9 || p[1] == 0xbb) && p[6] == 0) {             // cmp byte [rcx/rbx+disp32], 0
-            int32_t disp;
-            memcpy(&disp, p + 2, 4);
-            return disp > 0 && disp < 0x1000 ? disp : -1;
-        }
-    }
-    return -1;
-}
-
-// The flag's value (0 or 1), or -1 if it doesn't look like a bool.
-inline int ReadSinkFlag(void* manager, int offset) {
-    uint8_t v = 0xff;
-    if (offset < 0 || !SafeCopy(&v, static_cast<uint8_t*>(manager) + offset, 1)) return -1;
-    return v <= 1 ? v : -1;
-}
-
-// Asks the game thread to run all sinks at its next tick.
-inline bool RequestSinks(void* manager, int offset) {
-    if (ReadSinkFlag(manager, offset) < 0) return false;
-    __try {
-        static_cast<volatile uint8_t*>(manager)[offset] = 1;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-// IConsoleVariable::Set at console priority: stores the main value, records the priority and
-// runs the change delegates. Follow it with MirrorToRenderer (off the game thread). False if it
+// Sets at <setBy> priority: stores the value, records the priority, runs the change callbacks
+// and (on the game thread) passes the value to the renderer. Game thread only. False if it
 // faulted.
-inline bool Set(void* var, const wchar_t* value) {
+inline bool Set(void* var, const wchar_t* value, uint32_t setBy = kSetByConsole) {
     __try {
-        Virtual<SetFn>(var, kSet)(var, value, kSetByConsole);
+        Virtual<SetFn>(var, kSet)(var, value, setBy);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// ---------------------------------------------------------------- running on the game thread
+//
+// FEngineLoop::Tick calls IConsoleManager::CallAllConsoleVariableSinks (vtable +0x50) through the
+// manager's vtable once per frame, on the game thread. HookSinks gives the manager a copy of its
+// vtable with that slot pointing at <hook>; the hook does its work and then calls the original
+// (returned in *original). The copy keeps the pointer in front of the vtable. Nothing in the
+// game's code is changed, and UnhookSinks puts the original vtable back.
+using SinksFn = void(__fastcall*)(void* self);
+
+inline void* g_vtableCopy[1 + 256];
+inline void** g_vtableOriginal = nullptr;
+
+inline bool HookSinks(const uint8_t* base, void* manager, SinksFn hook, SinksFn* original) {
+    const std::vector<Section> code = Sections(base, SectionKind::Code);
+    void** vt = nullptr;
+    if (!SafeCopy(&vt, manager, 8) || !vt) return false;
+    size_t n = 0;
+    while (n < 256) {  // slots up to the first one that isn't code
+        const uint8_t* fn = nullptr;
+        if (!SafeCopy(&fn, vt + n, 8) || !Contains(code, fn)) break;
+        ++n;
+    }
+    const size_t slot = kCallAllConsoleVariableSinks / 8;
+    if (n <= kFindConsoleVariable / 8 || !SafeCopy(&g_vtableCopy[0], vt - 1, 8)) return false;
+    memcpy(&g_vtableCopy[1], vt, n * 8);
+    *original = reinterpret_cast<SinksFn>(vt[slot]);
+    g_vtableCopy[1 + slot] = reinterpret_cast<void*>(hook);
+    g_vtableOriginal = vt;
+    // TrueColorsTweaks and TrueColorsDLSS both hook this slot; the second copies the first's vtable,
+    // so its chain runs through the first add-on's code. Pinning keeps every hooked add-on's code
+    // loaded for the rest of the process, whatever order ReShade unloads them in.
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                       reinterpret_cast<LPCWSTR>(hook), &self);
+    InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(manager), &g_vtableCopy[1]);
+    return true;
+}
+
+// Puts the vtable back only if ours is still the one in place (nobody hooked on top of us).
+inline void UnhookSinks(void* manager) {
+    if (manager && g_vtableOriginal)
+        InterlockedCompareExchangePointer(reinterpret_cast<PVOID volatile*>(manager), g_vtableOriginal, &g_vtableCopy[1]);
+    g_vtableOriginal = nullptr;
 }
 
 }  // namespace cvars
