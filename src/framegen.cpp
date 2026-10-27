@@ -53,12 +53,12 @@ namespace {
 
 constexpr const char* kProjectId = "6f1d6e2a-5b8c-4f2e-9a43-7c2b8e1d4a90";
 
-// Byte offsets in UE 5.2's View uniform buffer (FViewUniformShaderParameters), read from a capture
-// (docs/FINDINGS.md): 5.2 has one more matrix after TranslatedWorldToClip than 5.6 (Reunion: 64,
-// 256, 448, 512), so the rest sit 64 bytes later. Checked against the buffer at run time
-// (CheckCamera).
-constexpr uint32_t kTranslatedWorldToClip = 0, kRelativeWorldToClip = 128, kViewToTranslatedWorld = 320,
-                   kViewToClip = 512, kViewToClipNoAA = 576;
+// Byte offsets in UE 4.25's View uniform buffer (FViewUniformShaderParameters), read from a capture
+// (docs/FINDINGS.md): TranslatedWorldToClip 0, WorldToClip 64 (UE 4 has no relative world; the
+// camera position comes out the same way), ViewToTranslatedWorld 256, ViewToClip 448 (jittered),
+// ViewToClipNoAA 512. Checked against the buffer at run time (CheckCamera).
+constexpr uint32_t kTranslatedWorldToClip = 0, kRelativeWorldToClip = 64, kViewToTranslatedWorld = 256,
+                   kViewToClip = 448, kViewToClipNoAA = 512;
 
 // Frame generation modes, as in The Quarry's add-on: Off, 2x, 3x, 4x (1-3 generated frames per
 // rendered frame) and Dynamic (Streamline picks the multiplier to reach the display's refresh rate).

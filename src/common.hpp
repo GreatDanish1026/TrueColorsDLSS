@@ -30,7 +30,12 @@ uint32_t PipeId(reshade::api::pipeline pipe);
 // kTsrMapped is false, DLSS and frame generation stay off and F10 captures every compute pass
 // in full. The names are kept from the TSR add-ons for now. Placeholders are never 0 (unknown
 // pipelines hash to 0).
-constexpr bool kTsrMapped = false;
+constexpr bool kTsrMapped = true;
+// UE 4.25's main TAA (TemporalAA.usf compute, the full-screen permutation at 100% screen
+// percentage; frame capture 2026-10-27, docs/FINDINGS.md): t0 exposure (1x1), t1 scene colour
+// (rgba16f, translucency already composited), t2 depth, t3 velocity (rg16unorm), t4 stencil,
+// t5 history; u0 output (= next frame's history); root CBV 3 its parameters, 4 the View buffer.
+constexpr uint32_t kTaaMain = 0x4a48869b;
 constexpr uint32_t kTsrClearPrevTextures = 0xdead0001;
 constexpr uint32_t kTsrForwardScatterDepth = 0xdead0002;
 constexpr uint32_t kTsrDilateVelocity = 0xdead0003;

@@ -1,20 +1,20 @@
-// Replaces TSR's output with DLSS.
+// Replaces the game's TAA with DLSS (Life is Strange: True Colors, UE 4.25).
 //
-// TSR's intermediates are transient (their memory is reused within the frame), so the inputs are
-// taken while they exist:
-//   DilateVelocity (t0 depth, t1 engine velocity): our own motion vectors (motion.hlsl) are
-//     computed there into our own texture. The engine's velocity only covers moving objects; the
-//     camera's motion comes from the depth and View.ClipToPrevClip (found in the View uniform
-//     buffer from TemporalAAJitter). DilateVelocity is recorded in a different command list, so
-//     the result is found later through its output u0, which DecimateHistory reads (t0; in UE 5.6
-//     it was RejectShading's t8).
-//   UpdateHistory (t0 scene color, t1 separate translucency): UE 5.2's TSR blends translucency
-//     (particles, light beams, light shafts, outline materials) in itself, so compose.hlsl blends
-//     it into our own copy of the scene color; it also adds the translucency to the bias mask
-//   ResolveHistory (u0): the 3840x2160 output, and from its parameters the render size, jitter and
-//     motion vector scale (offsets 0, 256 and 272, docs/FINDINGS.md). The game's pass runs first
-//     (it also writes a half-resolution copy the post-processing uses), then DLSS overwrites the
-//     full output.
+// UE 4's TAA is one compute pass with every input bound (common.hpp, kTaaMain): scene colour t1
+// (translucency already composited), depth t2, engine velocity t3, output u0; root CBV 4 is the
+// View uniform buffer. At that dispatch the add-on records:
+//   motion.hlsl: our own motion vectors. The engine's velocity only covers moving objects; the
+//     camera's motion comes from the depth and View.ClipToPrevClip (byte 1952 in UE 4.25).
+//   DLSS: colour, depth and our motion in, the TAA's output written, render size from
+//     View.ViewSizeAndInvSize (byte 2080) and jitter from View.TemporalAAJitter (byte 2016).
+// The game's TAA dispatch is then skipped. Its output is also its history for the next frame
+// (and the post-processing reads it), so DLSS's result serves both.
+//
+// This version runs at the game's resolution (DLAA): render resolutions below 100% need UE's TAAU
+// permutation and setting cvars on the game thread, not done yet.
+//
+// The TSR code from DoubleExposureDLSS (DilateVelocity chain, translucency blend) is still here
+// but nothing calls it in this game.
 //
 // NGX records its own compute state and descriptor heaps on the game's command list, and the
 // engine assumes its state is unchanged afterwards. So every command list's compute and
@@ -57,11 +57,11 @@ struct Settings {
     bool enabled = false;  // remembered across launches
     int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
     int mode = 0;          // DlssMode: 0 leaves the render resolution to the game's Resolution Scale
-    int maskMode = 1;      // motion.hlsl MaskMode: 0 off, 1 animated materials, 2 also moving objects
+    int maskMode = 0;      // motion.hlsl MaskMode: 0 off, 2 moving objects (UE 4 has no animation flag)
     bool showMask = false;  // debug tint, not saved
-    // motion.hlsl ObjectMode: 1 square-root decode, right for UE 5.2 (user's comparison, 2026-10-26: least
-    // tree noise and satchel smearing); 0 linear (UE 5.6, Reunion) and 2 ignored stay for diagnosis. Not saved.
-    int objectMode = 1;
+    // motion.hlsl ObjectMode: 0 linear decode, UE 4.2x's encoding (QuarryDLSS, UE 4.26: checked against
+    // camera reprojection); 1 square-root (UE 5.2) and 2 ignored stay for diagnosis. Not saved.
+    int objectMode = 0;
     int transMask = 1;  // translucency in the bias mask: 0 off, 1 partial, 2 full
 } g_set;
 
@@ -69,9 +69,9 @@ const char* const kTransMaskNames[] = {"Off", "Partial (recommended)", "Full"};
 constexpr int kTransMaskCount = 3;
 const float kTransMaskStrength[kTransMaskCount] = {0, 0.5f, 1};
 
-const char* const kMaskModeNames[] = {"Off", "Animated materials", "Animated materials and moving objects"};
+const char* const kMaskModeNames[] = {"Off", "Off", "Moving objects"};
 constexpr int kMaskModeCount = 3;
-const char* const kObjectModeNames[] = {"Engine, linear (UE 5.6 games)", "Engine, square-root (this game)", "Ignore (camera motion only)"};
+const char* const kObjectModeNames[] = {"Engine, linear (this game)", "Engine, square-root (UE 5.2 games)", "Ignore (camera motion only)"};
 constexpr int kObjectModeCount = 3;
 
 void LoadSettings() {
@@ -79,10 +79,11 @@ void LoadSettings() {
     reshade::get_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
     reshade::get_config_value(nullptr, RD_PRODUCT, "AnimationMask", g_set.maskMode);
-    if (g_set.maskMode < 0 || g_set.maskMode >= kMaskModeCount) g_set.maskMode = 1;
+    if (g_set.maskMode != 0 && g_set.maskMode != 2) g_set.maskMode = 0;
     reshade::get_config_value(nullptr, RD_PRODUCT, "TranslucencyMask", g_set.transMask);
     if (g_set.transMask < 0 || g_set.transMask >= kTransMaskCount) g_set.transMask = 1;
-    if (!kTsrMapped) g_set.enabled = false;  // TSR's passes aren't known in this game yet
+    if (!kTsrMapped) g_set.enabled = false;  // the upscaler's passes aren't known in this game yet
+    g_set.mode = 0;  // this version: the game's resolution only (DLAA at 100%)
 }
 
 void SaveSettings() {
@@ -559,50 +560,40 @@ void LogOnce(int& count, const char* fmt, uint32_t a, uint32_t b) {
     Log(fmt, a, b);
 }
 
-// Records motion.hlsl before the game's DilateVelocity (same inputs) and puts its state back.
-resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource velocity, resource* maskOut,
-                       std::vector<float>* viewOut) {
+// UE 4.25's View uniform buffer (FViewUniformShaderParameters), byte offsets from the capture:
+// ClipToPrevClip 1952 (unjittered), TemporalAAJitter 2016 (this frame's, last frame's; clip
+// units), ViewRectMin 2064, ViewSizeAndInvSize 2080. ViewToClip (448) holds the jitter in its
+// third row, which checks the layout each frame.
+constexpr int kViewClipToPrevClip = 1952, kViewJitter = 2016, kViewRectMin = 2064, kViewSize = 2080,
+              kViewToClipJitterRow = 480;
+
+// Records motion.hlsl before DLSS (in the TAA's command list) and puts the game's state back.
+resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource velocity, const float size[2],
+                       const std::vector<float>& view, resource* maskOut) {
     *maskOut = {0};
-    static int badFormat = 0, badParams = 0;
+    static int badFormat = 0;
     device* dev = cl->get_device();
     if (!velocity.handle) return Why("motion: no velocity"), resource{0};
     const resource_desc dd = dev->get_resource_desc(depth), vd = dev->get_resource_desc(velocity);
-    if (dd.texture.format != format::r32_g8_typeless || vd.texture.format != format::r16g16b16a16_unorm) {
-        LogOnce(badFormat, "motion: depth format %u, velocity format %u: TSR kept for this view",
+    if (dd.texture.format != format::r32_g8_typeless || vd.texture.format != format::r16g16_unorm ||
+        vd.texture.width < size[0] || vd.texture.height < size[1]) {
+        LogOnce(badFormat, "motion: depth format %u, velocity format %u: TAA kept for this view",
                 static_cast<uint32_t>(dd.texture.format), static_cast<uint32_t>(vd.texture.format));
-        return {0};
+        return Why("motion: velocity is a placeholder or another format (camera cut)"), resource{0};
     }
-    float size[2] = {0, 0}, jitter[2] = {0, 0};
-    if (!RenderSize(cl, s.compute, size) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2) ||
-        size[0] < 16 || size[1] < 16 || size[0] > dd.texture.width || size[1] > dd.texture.height ||
-        std::fabs(jitter[0]) > 0.5f || std::fabs(jitter[1]) > 0.5f) {
-        LogOnce(badParams, "motion: DilateVelocity parameters not usable (size %u x %u)", static_cast<uint32_t>(size[0]),
-                static_cast<uint32_t>(size[1]));
-        return {0};
-    }
-    static std::vector<float> view(kViewScanFloats);
-    const uint32_t viewFloats = ReadConstantsUpTo(cl, s.compute, 3, view.data(), kViewScanFloats);
-    if (viewFloats < kViewNeededFloats || (g_motion.offset >= 0 && viewFloats * 4u < static_cast<uint32_t>(g_motion.offset) + 144))
-        return Why("motion: View buffer"), resource{0};
-    if (g_motion.offset < 0) {
-        FindClipToPrevClip(view.data(), jitter, size);
-        if (g_motion.offset < 0) return Why("motion: camera not found yet"), resource{0};
-    }
+    g_motion.offset = kViewClipToPrevClip;
     if (!CreateMotionPipeline(dev)) return {0};
     const resource tex = MotionTexture(dev, dd.texture.width, dd.texture.height);
     const resource mask = MotionTexture(dev, dd.texture.width, dd.texture.height, format::r8_unorm);
     if (!tex.handle || !mask.handle) return Why("motion: no texture (limit)"), resource{0};
     const resource_view srvs[2] = {View(dev, depth, format::r32_float_x8_uint, false),
-                                   View(dev, velocity, format::r16g16b16a16_unorm, false)};
+                                   View(dev, velocity, format::r16g16_unorm, false)};
     const resource_view uavs[2] = {View(dev, tex, format::r16g16_float, true), View(dev, mask, format::r8_unorm, true)};
     if (!srvs[0].handle || !srvs[1].handle || !uavs[0].handle || !uavs[1].handle) return Why("motion: views"), resource{0};
 
     float params[24];
     const float* m = view.data() + g_motion.offset / 4;
     memcpy(params, m, 16 * sizeof(float));
-    // Frame generation takes the camera at ResolveHistory, and only for the view on screen (the game
-    // renders a second TSR view): kept with this view's motion vectors until then.
-    *viewOut = view;
     params[16] = size[0], params[17] = size[1], params[18] = 1 / size[0], params[19] = 1 / size[1];
     const uint32_t maskMode = static_cast<uint32_t>(g_set.maskMode);
     memcpy(&params[20], &maskMode, 4);
@@ -695,30 +686,6 @@ void OnDestroyResource(device* dev, resource r) {
         dev->destroy_resource_view(it->second);
         g_motion.views.erase(it);
     }
-}
-
-void OnDilateVelocity(command_list* cl, ListState& s) {
-    const resource depth = Bound(cl, s.compute, 0, 0);
-    const resource velocity = Bound(cl, s.compute, 0, 1);
-    const resource out = Bound(cl, s.compute, 1, 0);
-    if (!depth.handle || !out.handle) return;
-    if (g_links.size() > 64) g_links.clear();
-    Link& link = g_links[out.handle];
-    link.depth = depth;
-    link.motion = ComputeMotion(cl, s, depth, velocity, &link.mask, &link.view);
-}
-
-// UE 5.2: DecimateHistory is the first pass after DilateVelocity that reads its output (t0);
-// RejectShading doesn't (5.6's read it at t8).
-void OnChainStart(command_list* cl, ListState& s) {
-    s.chain = Chain();
-    const resource dilated = Bound(cl, s.compute, 0, 0);
-    auto it = g_links.find(dilated.handle);
-    if (it == g_links.end()) return Why("chain: DilateVelocity not seen");
-    s.chain.depth = it->second.depth;
-    s.chain.motion = it->second.motion;  // none: TSR kept for this view
-    s.chain.mask = it->second.mask;
-    s.chain.view = it->second.view;
 }
 
 // ---------------------------------------------------------------- translucency
@@ -814,57 +781,69 @@ bool Compose(command_list* cl, ListState& s) {
     return true;
 }
 
-void OnUpdateHistory(command_list* cl, ListState& s) {
-    if (!s.chain.motion.handle) return Why("update: no motion in this list");
-    if (Compose(cl, s)) return;
-    ++g_motion.copied;
-    s.chain.color = CopyInput(cl, Bound(cl, s.compute, 0, 0), resource_usage::shader_resource_non_pixel,
-                              format::r16g16b16a16_float, "color");
-    if (!s.chain.color.handle) Why("update: colour copy failed");
-}
-
 // ---------------------------------------------------------------- DLSS
 
-bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z) {
+// The game's TAA (kTaaMain): DLSS in its place. True if the game's dispatch is to be skipped.
+bool OnTaa(command_list* cl, ListState& s) {
     device* dev = cl->get_device();
-    const Chain chain = s.chain;
-    s.chain = Chain();  // used once
-    const resource output = Bound(cl, s.compute, 1, 0);
-    {
-        uint64_t key = 0;
-        if (output.handle) {
-            const resource_desc od = dev->get_resource_desc(output);
-            key = (static_cast<uint64_t>(od.texture.width) << 32) | od.texture.height;
-        }
-        ViewStats& vs = g_stats[key];
+    const resource color = Bound(cl, s.compute, 0, 1), depth = Bound(cl, s.compute, 0, 2),
+                   velocity = Bound(cl, s.compute, 0, 3), output = Bound(cl, s.compute, 2, 0);
+    uint64_t outKey = 0;
+    if (output.handle) {
+        const resource_desc od = dev->get_resource_desc(output);
+        outKey = (static_cast<uint64_t>(od.texture.width) << 32) | od.texture.height;
+    }
+    ViewStats& vs = g_stats[outKey];
+    if (!output.handle || !color.handle || !depth.handle) {
         if (!output.handle) ++vs.noOutput;
-        else if (!chain.depth.handle) ++vs.noDepth;
-        else if (!chain.motion.handle) ++vs.noMotion;
-        else if (!chain.color.handle) ++vs.noColor;
-    }
-    if (!output.handle || !chain.depth.handle || !chain.motion.handle || !chain.color.handle) {
-        Skip("an input is missing (output, depth, motion, colour)", output.handle != 0, chain.depth.handle != 0,
-             (chain.motion.handle != 0) * 10 + (chain.color.handle != 0));
+        else if (!depth.handle) ++vs.noDepth;
+        else ++vs.noColor;
+        Skip("an input is missing (output, colour, depth)", output.handle != 0, color.handle != 0, depth.handle != 0);
         return false;
     }
-    const resource_desc out = dev->get_resource_desc(output);
-    if (!IsHdrColor(out.texture.format)) {
-        Skip("TSR's output has an unexpected format (width, height, format)", out.texture.width, out.texture.height,
-             static_cast<uint32_t>(out.texture.format));
+    const resource_desc out = dev->get_resource_desc(output), cd = dev->get_resource_desc(color);
+    if (!IsHdrColor(out.texture.format) || !IsHdrColor(cd.texture.format)) {
+        Skip("colour or output has an unexpected format (output, colour)", static_cast<uint32_t>(out.texture.format),
+             static_cast<uint32_t>(cd.texture.format));
         return false;
     }
-    float common[2] = {0, 0}, jitter[2] = {0, 0};
-    if (!RenderSize(cl, s.compute, common) || !ReadConstants(cl, s.compute, 2, 256, jitter, 2)) {
-        g_error = "TSR parameters not readable";
-        Skip("TSR's parameters aren't readable");
+    static std::vector<float> view(kViewScanFloats);
+    const uint32_t viewFloats = ReadConstantsUpTo(cl, s.compute, 4, view.data(), kViewScanFloats);
+    if (viewFloats * 4u < kViewSize + 16) {
+        Why("View buffer not readable");
+        Skip("the View buffer isn't readable", viewFloats);
         return false;
     }
-    const resource_desc cd = dev->get_resource_desc(chain.color);
-    const unsigned rw = static_cast<unsigned>(common[0]), rh = static_cast<unsigned>(common[1]);
-    if (!rw || !rh || rw > cd.texture.width || rh > cd.texture.height || std::fabs(jitter[0]) > 0.5f ||
-        std::fabs(jitter[1]) > 0.5f) {
-        g_error = "TSR parameters out of range";
-        Skip("TSR's parameters are out of range (render width, height, colour width)", rw, rh, cd.texture.width);
+    const float* v = view.data();
+    const float size[2] = {v[kViewSize / 4], v[kViewSize / 4 + 1]};
+    const float jitterClip[2] = {v[kViewJitter / 4], v[kViewJitter / 4 + 1]};
+    uint32_t rectMin[2] = {1, 1};
+    memcpy(rectMin, v + kViewRectMin / 4, 8);
+    const bool layoutOk = v[kViewToClipJitterRow / 4] == jitterClip[0] && v[kViewToClipJitterRow / 4 + 1] == jitterClip[1] &&
+                          LooksLikeClipToPrevClip(v + kViewClipToPrevClip / 4);
+    if (!layoutOk || rectMin[0] || rectMin[1] || !(size[0] >= 16 && size[1] >= 16) || size[0] > cd.texture.width ||
+        size[1] > cd.texture.height || size[0] > out.texture.width || size[1] > out.texture.height) {
+        static int logged = 0;
+        if (logged++ < 5)
+            Log("TAA view: layout %s, rect min %u,%u, size %.0fx%.0f, colour %ux%u, output %ux%u: TAA kept", layoutOk ? "ok" : "NOT as expected",
+                rectMin[0], rectMin[1], size[0], size[1], cd.texture.width, cd.texture.height, out.texture.width,
+                out.texture.height);
+        Why("TAA view: layout or size");
+        ++g_skipped;
+        return false;
+    }
+    // UE's TemporalJitterPixels: clip units to pixels, y down.
+    const float jitter[2] = {jitterClip[0] * size[0] * 0.5f, -jitterClip[1] * size[1] * 0.5f};
+    if (std::fabs(jitter[0]) > 0.5f || std::fabs(jitter[1]) > 0.5f) {
+        Skip("jitter out of range");
+        return false;
+    }
+    resource mask = {0};
+    const resource motion = ComputeMotion(cl, s, depth, velocity, size, view, &mask);
+    if (!motion.handle) {
+        ++vs.noMotion;
+        ++g_skipped;  // camera-cut frames bind a 1x1 velocity placeholder: the game's TAA handles them
+        g_resetByOutput[outKey] = true;
         return false;
     }
     std::string err;
@@ -873,26 +852,23 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
         ++g_skipped;
         return false;
     }
+    const unsigned rw = static_cast<unsigned>(size[0]), rh = static_cast<unsigned>(size[1]);
     g_lastJitter[0] = jitter[0], g_lastJitter[1] = jitter[1];
     if (g_resetAll) g_resetByOutput.clear(), g_resetAll = false;
-    const uint64_t outKey = (static_cast<uint64_t>(out.texture.width) << 32) | out.texture.height;
     auto rs = g_resetByOutput.find(outKey);
-    const uint64_t size = (static_cast<uint64_t>(rw) << 32) | rh;
+    const uint64_t sizeKey = (static_cast<uint64_t>(rw) << 32) | rh;
     auto ss = g_sizeByOutput.find(outKey);
-    const bool resized = ss != g_sizeByOutput.end() && ss->second != size;
-    g_sizeByOutput[outKey] = size;
+    const bool resized = ss != g_sizeByOutput.end() && ss->second != sizeKey;
+    g_sizeByOutput[outKey] = sizeKey;
     if (g_sizeByOutput.size() > 64) g_sizeByOutput.clear();
     const bool reset = rs == g_resetByOutput.end() || rs->second || resized;
 
-    cl->dispatch(x, y, z);  // the game's ResolveHistory, with its own bindings
-    cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
-
     dlss::Inputs in;
-    in.color = reinterpret_cast<ID3D12Resource*>(chain.color.handle);
-    in.motion = reinterpret_cast<ID3D12Resource*>(chain.motion.handle);
-    in.depth = reinterpret_cast<ID3D12Resource*>(chain.depth.handle);
+    in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
+    in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
+    in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
     in.output = reinterpret_cast<ID3D12Resource*>(output.handle);
-    if (g_set.maskMode > 0 || g_set.transMask > 0) in.biasMask = reinterpret_cast<ID3D12Resource*>(chain.mask.handle);
+    if (g_set.maskMode > 0) in.biasMask = reinterpret_cast<ID3D12Resource*>(mask.handle);
     in.renderWidth = rw, in.renderHeight = rh;
     g_lastRender[0] = rw, g_lastRender[1] = rh;
     g_lastOutput[0] = out.texture.width, g_lastOutput[1] = out.texture.height;
@@ -905,32 +881,31 @@ bool Evaluate(command_list* cl, ListState& s, uint32_t x, uint32_t y, uint32_t z
     cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
     if (ok && g_set.showMask) {
         cl->bind_descriptor_tables(shader_stage::all_compute, s.compute.layout, 0, 0, nullptr);  // ReShade's heaps back
-        TintMask(cl, output, chain.mask, rw, rh);
+        TintMask(cl, output, mask, rw, rh);
     }
     Restore(cl, s);
-    {
-        ViewStats& vs = g_stats[outKey];
-        if (!ok) ++vs.other;
-        else ++vs.evaluated, vs.tagged += FrameGenIsScreen(out.texture.width, out.texture.height) && !chain.view.empty();
-    }
-    if (ok) {
-        // Only the view on screen: Double Exposure also runs TSR for a 4096x2160 view.
-        if (FrameGenIsScreen(out.texture.width, out.texture.height) && !chain.view.empty()) {
-            FrameGenSetCamera(chain.view.data(), g_motion.offset);
-            FrameGenTag(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in.depth, in.motion, rw, rh,
-                        in.jitterX, in.jitterY, reset);
-        }
-        g_resetByOutput[outKey] = false;
-        g_error.clear();
-        if (++g_evaluated == 1) Log("DLSS: first frame evaluated");
-    } else {
+    if (!ok) {
+        ++vs.other;
         ++g_skipped;
         if (g_error != err) {
             g_error = err;
             Log("DLSS: %s", err.c_str());
         }
+        return false;  // the game's TAA still runs
     }
-    return true;  // the game's dispatch was recorded above
+    ++vs.evaluated;
+    if (FrameGenIsScreen(out.texture.width, out.texture.height)) {
+        ++vs.tagged;
+        FrameGenSetCamera(view.data(), kViewClipToPrevClip);
+        FrameGenTag(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in.depth, in.motion, rw, rh,
+                    in.jitterX, in.jitterY, reset);
+    }
+    g_resetByOutput[outKey] = false;
+    g_error.clear();
+    if (++g_evaluated == 1)
+        Log("DLSS: first frame evaluated (%ux%u -> %ux%u, jitter %.3f %.3f px)", rw, rh, out.texture.width,
+            out.texture.height, jitter[0], jitter[1]);
+    return true;  // DLSS wrote the TAA's output: skip the game's dispatch
 }
 
 bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
@@ -938,21 +913,8 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
     ListState* s = State(cl);
     if (!s) return false;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    switch (s->computeId) {
-        case kTsrDilateVelocity:
-            OnDilateVelocity(cl, *s);
-            return false;
-        case kTsrDecimateHistory:
-            OnChainStart(cl, *s);
-            return false;
-        case kTsrUpdateHistory:
-            OnUpdateHistory(cl, *s);
-            return false;
-        case kTsrResolveHistory:
-            return Evaluate(cl, *s, x, y, z);
-        default:
-            return false;
-    }
+    (void)x, (void)y, (void)z;
+    return s->computeId == kTaaMain && OnTaa(cl, *s);
 }
 
 void OnDestroyDevice(device* dev) {
@@ -1199,14 +1161,8 @@ void DrawUpscalerSettings() {
     ImGui::BeginDisabled(!kTsrMapped);
     if (ImGui::Checkbox("DLSS (F9)", &g_set.enabled)) SaveAndLog();
     ImGui::EndDisabled();
-    Help("NVIDIA DLSS in place of the game's TSR upscaler. F9 switches it on and off while playing, to compare.");
-
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Render resolution", &g_set.mode, kDlssModeNames, kDlssModeCount)) SaveAndLog();
-    Help("The resolution DLSS renders at, as a share of the screen's. \"Game's Resolution Scale\" keeps the game's "
-         "menu setting; the others override it while DLSS is on and give it back when DLSS is off.\n\nKeep the "
-         "game's Secondary Resolution Scale at 100%, so DLSS outputs the full screen resolution.");
-    if (g_res.failed) ImGui::TextColored(kWarn, "Render resolution: %s", g_res.error.c_str());
+    Help("NVIDIA DLSS in place of the game's TAA anti-aliasing. F9 switches it on and off while playing, to compare.");
+    ImGui::TextDisabled("Render resolution: the game's (DLAA at 100%%); lower DLSS modes come in a later version.");
 
     int cur = 2;
     for (int i = 0; i < kPresetCount; ++i)
@@ -1225,21 +1181,13 @@ void DrawUpscalerAdvanced() {
         Log("diagnosis: object motion %s", kObjectModeNames[g_set.objectMode]);
     }
     Help("How the motion of things that move by themselves (characters, trees in the wind, cloth) is read from the "
-         "engine. Square-root is right for this game (UE 5.2); the others are for testing and go back to it at "
-         "each launch.");
+         "engine. Linear is UE 4's encoding; the others are for testing and go back to it at each launch.");
 
-    ImGui::SeparatorText("Animation mask");
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Mask", &g_set.maskMode, kMaskModeNames, kMaskModeCount)) SaveAndLog();
-    Help("Tells DLSS where to trust the current frame over its history.\n\nAnimated materials: what the game's "
-         "materials flag as animated (none in the scenes tested).\nAnimated materials and moving objects: every "
-         "moving object as well; less smearing, slightly less stable fine detail on them.\nOff: no mask.");
-    ImGui::SetNextItemWidth(ControlWidth());
-    if (ImGui::Combo("Translucent effects", &g_set.transMask, kTransMaskNames, kTransMaskCount)) SaveAndLog();
-    Help("Adds translucent effects (particles, light beams, light shafts) to the mask. They have no motion of "
-         "their own, so without it DLSS can smear or ghost them over a moving background.\n\nPartial: less "
-         "ghosting, the background behind them stays smooth.\nFull: least ghosting, a little more shimmer "
-         "under large effects.\nOff: not masked (they're still drawn).");
+    ImGui::SeparatorText("Moving objects mask");
+    bool movingMask = g_set.maskMode == 2;
+    if (ImGui::Checkbox("Mask moving objects", &movingMask)) g_set.maskMode = movingMask ? 2 : 0, SaveAndLog();
+    Help("Tells DLSS to trust the current frame over its history on moving objects: less smearing behind\n"
+         "characters, slightly less stable fine detail on them.");
     ImGui::Checkbox("Show the mask in red", &g_set.showMask);
     Help("Tints the masked pixels red. For testing; off at each launch.");
 
@@ -1251,8 +1199,8 @@ void DrawUpscalerAdvanced() {
 std::string UpscalerHeadline(bool* warn) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     *warn = false;
-    if (!kTsrMapped) return (*warn = true), "DLSS unavailable: TSR not mapped for this game build";
-    if (!g_set.enabled) return "DLSS off: the game's TSR";
+    if (!kTsrMapped) return (*warn = true), "DLSS unavailable: TAA not mapped for this game build";
+    if (!g_set.enabled) return "DLSS off: the game's TAA";
     if (!g_error.empty()) return (*warn = true), "DLSS: " + g_error;
     if (!g_lastRender[0]) return "DLSS on: starts with the next game frame";
     char buf[160];
@@ -1266,7 +1214,7 @@ void DrawUpscalerStatus() {
     ImGui::TextDisabled("%s", g_set.enabled ? dlss::Status().c_str() : "off");
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        ImGui::TextDisabled("Frames upscaled %llu, left to TSR %llu (menus, loading, first frames)",
+        ImGui::TextDisabled("Frames by DLSS %llu, left to the game's TAA %llu (menus, loading, camera cuts)",
                             static_cast<unsigned long long>(g_evaluated.load()),
                             static_cast<unsigned long long>(g_skipped.load()));
         if (g_motion.composed || g_motion.copied)

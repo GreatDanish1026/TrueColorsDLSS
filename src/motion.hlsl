@@ -5,11 +5,9 @@
 // everything else the motion is the camera's: the pixel's clip position (screen xy, device z)
 // through View.ClipToPrevClip gives its previous clip position. That's what TSR does itself.
 //
-// Mask: UE 5.1+ packs a "pixel animation" flag into the lowest bit of the velocity's w (16-bit
-// unorm; the rest of z and w hold depth): set for materials whose pixels animate in ways velocity
-// doesn't describe (wind, panning textures, cloth). TSR distrusts its history there; DLSS does the
-// same where the mask is 1. MaskMode 0 writes 0 (no mask), 1 marks flagged pixels, 2 also marks
-// every pixel with object velocity (moving objects: less smearing, a little less stable).
+// Mask: UE 4.25's velocity is two channels (rg16unorm) with no "pixel animation" flag, so MaskMode
+// 0 and 1 write 0 (no mask) and 2 marks every pixel with object velocity (moving objects: less
+// smearing, a little less stable).
 
 cbuffer Params : register(b0) {
     float4 Row0, Row1, Row2, Row3;  // View.ClipToPrevClip, one row each (UE: row vector * matrix)
@@ -17,13 +15,13 @@ cbuffer Params : register(b0) {
     float2 InvSize;
     uint MaskMode;
     float MaskStrength;
-    uint ObjectMode;  // object velocity: 1 square-root ("gamma") decode, UE 5.2's encoding (default);
-                      // 0 linear decode (UE 5.6, Reunion); 2 ignored (camera motion only)
+    uint ObjectMode;  // object velocity: 0 linear decode (UE 4.2x, the default here); 1 square-root
+                      // ("gamma") decode (UE 5.2); 2 ignored (camera motion only)
     uint Pad;
 };
 
 Texture2D<float> Depth : register(t0);      // device z, reversed
-Texture2D<float4> Velocity : register(t1);  // UE encoded velocity (rgba16unorm)
+Texture2D<float4> Velocity : register(t1);  // UE encoded velocity (rg16unorm; reads z 0, w 1)
 RWTexture2D<float2> Motion : register(u0);
 RWTexture2D<float> Mask : register(u1);
 
@@ -45,7 +43,6 @@ void main(uint2 id : SV_DispatchThreadID) {
     }
     Motion[id] = -v * float2(0.5 * Size.x, -0.5 * Size.y);
 
-    const bool animated = written && (uint(e.w * 65535.0 + 0.5) & 1u) != 0;
-    const bool marked = (MaskMode >= 1 && animated) || (MaskMode >= 2 && written);
+    const bool marked = MaskMode >= 2 && written;
     Mask[id] = marked ? MaskStrength : 0;
 }

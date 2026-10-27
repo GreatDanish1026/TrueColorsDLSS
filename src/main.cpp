@@ -227,9 +227,7 @@ struct ListLog {
 };
 
 // TSR's compute shaders in this game build (stable across runs; docs/FINDINGS.md), in order.
-const uint32_t kTsrShaders[] = {rd::kTsrClearPrevTextures,  rd::kTsrForwardScatterDepth, rd::kTsrDilateVelocity,
-                                rd::kTsrDecimateHistory,    rd::kTsrRejectShading,       rd::kTsrSpatialAntiAliasing,
-                                rd::kTsrFilterAntiAliasing, rd::kTsrUpdateHistory,       rd::kTsrResolveHistory};
+const uint32_t kTsrShaders[] = {rd::kTaaMain};
 
 bool IsTsr(uint32_t id) {
     for (uint32_t t : kTsrShaders)
@@ -320,7 +318,7 @@ void OnBindPipeline(command_list* cl, pipeline_stage stages, pipeline pipe) {
         g_listPipe[cl->get_native()] = id;
         g_listPipeHandle[cl->get_native()] = pipe.handle;
     }
-    Add(cl, Format("compute pipeline cs%08x%s", id, IsTsr(id) ? " (TSR)" : ""));
+    Add(cl, Format("compute pipeline cs%08x%s", id, IsTsr(id) ? " (TAA)" : ""));
 }
 
 bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
