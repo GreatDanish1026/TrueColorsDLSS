@@ -354,6 +354,13 @@ using SinksFn = void(__fastcall*)(void* self);
 inline void* g_vtableCopy[1 + 256];
 inline void** g_vtableOriginal = nullptr;
 
+// Code outside the game's exe: the other add-on's hook in a vtable copy it made.
+inline bool IsExecutable(const void* p) {
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+    return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
 inline bool HookSinks(const uint8_t* base, void* manager, SinksFn hook, SinksFn* original) {
     const std::vector<Section> code = Sections(base, SectionKind::Code);
     void** vt = nullptr;
@@ -361,7 +368,7 @@ inline bool HookSinks(const uint8_t* base, void* manager, SinksFn hook, SinksFn*
     size_t n = 0;
     while (n < 256) {  // slots up to the first one that isn't code
         const uint8_t* fn = nullptr;
-        if (!SafeCopy(&fn, vt + n, 8) || !Contains(code, fn)) break;
+        if (!SafeCopy(&fn, vt + n, 8) || !(Contains(code, fn) || IsExecutable(fn))) break;
         ++n;
     }
     const size_t slot = kCallAllConsoleVariableSinks / 8;
