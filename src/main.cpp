@@ -2,12 +2,11 @@
 // that will replace the game's TAA/TAAU with DLSS (and add frame generation). Built from
 // DoubleExposureDLSS 1.0.2 (UE 5.2, TSR). Separate from TrueColorsTweaks.
 //
-// 0.0.1 is the frame capture tool plus DoubleExposureDLSS's DLSS code, which stays off until the
-// upscaler's passes are mapped for this game (common.hpp, kTsrMapped). "Capture" (F10) records
-// two frames of GPU work (every compute dispatch with a stable id of its shader, the textures
-// bound to it by register, its constant buffers' first bytes, resource state transitions with
-// each resource's size and format, copies, render target binds, and which queue each command
-// list ran on) to TrueColorsDLSS-frame-N.txt next to the game exe.
+// This file is the frame capture tool (F10): it records two frames of GPU work (every compute
+// dispatch with a stable id of its shader, the textures bound to its declared registers, its
+// constant buffers' first bytes, resource state transitions, copies, render target binds, and which
+// queue each command list ran on) to TrueColorsDLSS-frame-N.txt next to the game exe, for finding
+// the TAA pass again after a game update. DLSS is in upscaler.cpp, frame generation in framegen.cpp.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

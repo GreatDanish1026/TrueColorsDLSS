@@ -1,7 +1,7 @@
 ﻿Third-party notices
 ===================
 
-DoubleExposureDLSS.addon64 is compiled against the following headers, which are
+TrueColorsDLSS.addon64 is compiled against the following headers, which are
 included in the source repository under third_party/.
 
 ----------------------------------------------------------------------------
@@ -66,7 +66,7 @@ https://github.com/NVIDIA-RTX/Streamline
 ----------------------------------------------------------------------------
 Headers from the SDK release (tag v2.14.16).
 
-The DoubleExposureDLSS release zip redistributes NVIDIA-signed runtime files from that
+The TrueColorsDLSS release zip redistributes NVIDIA-signed runtime files from that
 same release, unmodified: nvngx_dlss.dll (DLSS 310.9.16) and, in the streamline
 folder, sl.interposer.dll, sl.common.dll, sl.dlss_g.dll, sl.reflex.dll,
 sl.pcl.dll and nvngx_dlssg.dll. Their licences are in the zip's licenses folder:

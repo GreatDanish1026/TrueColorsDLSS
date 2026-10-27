@@ -1,4 +1,4 @@
-# TrueColorsDLSS 0.3.0
+# TrueColorsDLSS 1.0.0
 
 ReShade add-on for **Life is Strange: True Colors** (Unreal Engine 4.25, DirectX 12) that replaces
 the game's TAA anti-aliasing with **NVIDIA DLSS** and adds **DLSS Frame Generation**. The game has
