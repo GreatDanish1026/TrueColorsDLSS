@@ -35,6 +35,10 @@ bool PipeHasTaaRegisters(reshade::api::pipeline pipe);
 // in full. The names are kept from the TSR add-ons for now. Placeholders are never 0 (unknown
 // pipelines hash to 0).
 constexpr bool kTsrMapped = true;
+// Frame generation's inputs go to their frame when the game submits them (false; UE 4.25 submits
+// and presents on its RHI thread) or when they're recorded (true, ReunionDLSS: UE 5.6 submits on a
+// thread of its own). framegen.cpp is shared with ReunionDLSS and DoubleExposureDLSS.
+constexpr bool kTagAtRecord = false;
 // UE 4.25's main TAA (TemporalAA.usf compute, the full-screen permutation at 100% screen
 // percentage; frame capture 2026-10-27, docs/FINDINGS.md): t0 exposure (1x1), t1 scene colour
 // (rgba16f, translucency already composited), t2 depth, t3 velocity (rg16unorm), t4 stencil,

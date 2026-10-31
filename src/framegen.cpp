@@ -38,11 +38,13 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "fsrfg.hpp"
 #include "ui_alpha_cs.h"  // kUiAlphaCs: ui_alpha.hlsl compiled by build.ps1
 #include "version.h"
 
@@ -56,7 +58,8 @@ constexpr const char* kProjectId = "6f1d6e2a-5b8c-4f2e-9a43-7c2b8e1d4a90";
 // Byte offsets in UE 4.25's View uniform buffer (FViewUniformShaderParameters), read from a capture
 // (docs/FINDINGS.md): TranslatedWorldToClip 0, WorldToClip 64 (UE 4 has no relative world; the
 // camera position comes out the same way), ViewToTranslatedWorld 256, ViewToClip 448 (jittered),
-// ViewToClipNoAA 512. Checked against the buffer at run time (CheckCamera).
+// ViewToClipNoAA 512. Checked against the buffer at run time (CheckCamera). This file is shared with
+// ReunionDLSS (UE 5.6: the same offsets) and DoubleExposureDLSS (UE 5.2: 64 bytes later).
 constexpr uint32_t kTranslatedWorldToClip = 0, kRelativeWorldToClip = 64, kViewToTranslatedWorld = 256,
                    kViewToClip = 448, kViewToClipNoAA = 512;
 
@@ -65,14 +68,23 @@ constexpr uint32_t kTranslatedWorldToClip = 0, kRelativeWorldToClip = 64, kViewT
 enum Mode : int { kOff, k2x, k3x, k4x, kDynamic, kModeCount };
 const char* const kModeNames[kModeCount] = {"Off", "2x", "3x", "4x", "Dynamic"};
 
+// Whose frame generation: NVIDIA's (Streamline, RTX 40/50) or AMD's (FSR, any DirectX 12 GPU).
+// Each replaces the game's swapchain, so the one picked at launch is used until a restart.
+enum Tech : int { kTechDlss, kTechFsr, kTechCount };
+const char* const kTechNames[kTechCount] = {"DLSS (NVIDIA RTX 40/50)", "FSR (any graphics card)"};
+
 struct Settings {
+    int tech = kTechDlss;  // ini FrameGenTech
     int mode = kOff;
     bool enabled = false;  // mode != kOff
     // sl::Constants::minRelativeLinearDepthObjectSeparation: how far apart in depth two surfaces
     // must be for DLSS-G to treat them as separate objects, in units of 1 / device depth. UE's
     // near plane is 10 cm, so NVIDIA's default 40 is 4 m.
     float separation = 40;
+    // FSR: what it compares the back buffer with to find the HUD (fsrfg::HudMode); ini FsrHudMode.
+    int fsrHud = 0;
 } g_set;
+const char* const kFsrHudNames[] = {"Composite (recommended)", "Picture before the HUD", "Off"};
 
 uint32_t g_maxFrames = 1;  // DLSSGState::numFramesToGenerateMax
 bool g_dynamicSupported = false, g_capsKnown = false;
@@ -102,6 +114,8 @@ struct SlApi {
 // list) come back into this add-on on the same thread through ReShade's events (OnExecute). A plain
 // std::mutex throws there ("resource deadlock would occur") and the game aborted at exit (0.6.0).
 std::recursive_mutex g_mutex;
+int g_activeTech = kTechDlss;  // g_set.tech at launch
+bool Fsr() { return g_activeTech == kTechFsr; }
 bool g_initTried = false, g_ready = false;
 std::atomic<bool> g_upgraded{false};  // the game's swapchain is Streamline's proxy
 std::string g_status = "off";
@@ -116,6 +130,7 @@ struct Tagged {
     void Set(uint32_t frame) { previous = last, last = frame; }
 };
 Tagged g_inputs, g_hudless;  // depth + motion + constants; the picture before the HUD
+Tagged g_hudMask;            // FSR: frames whose HUD mask was recorded
 
 // Inputs are prepared while the game records a frame's command list and handed to Streamline when
 // that list is submitted (execute_command_list). Lists are submitted in the order frames are
@@ -135,6 +150,36 @@ struct PendingHud {
 };
 std::map<uint64_t, PendingInputs> g_pendingInputs;  // by native command list
 std::map<uint64_t, PendingHud> g_pendingHud;
+// FSR: inputs by the frame they belong to, handed to FSR right before that frame's Present.
+std::map<uint32_t, PendingInputs> g_fsrByFrame;
+
+// Frames are being counted: Streamline's frame token exists, or FSR's swapchain runs.
+bool Frames() { return Fsr() ? g_ready && g_upgraded : g_token != nullptr; }
+
+// Which frame inputs belong to, decided when they're recorded (kTagAtRecord, UE 5.6): this frame,
+// or the next one if this one has them already (UE 5.6 records the next frame while this one is
+// presenting; it also submits on a separate thread, so the submission order can't tell). UINT32_MAX
+// if both have them.
+uint32_t TargetFrame(const Tagged& t) {
+    if (!t.Has(g_frame)) return g_frame;
+    if (!t.Has(g_frame + 1)) return g_frame + 1;
+    return UINT32_MAX;
+}
+
+// Streamline's token for <frame> (this frame's, or the next one's).
+sl::FrameToken* TokenFor(uint32_t frame) {
+    if (frame == g_frame) return g_token;
+    sl::FrameToken* t = nullptr;
+    return g_sl.getNewFrameToken(t, &frame) == sl::Result::eOk ? t : nullptr;
+}
+
+// The order of inputs and presents for the first frames with inputs, in the log (diagnosis).
+int g_traceLines = 0;
+void Trace(const char* what, uint32_t frame) {
+    if (g_traceLines >= 120) return;
+    if (++g_traceLines == 120) Log("trace: (last trace line)");
+    Log("trace: %s, frame %u (presenting frame %u, thread %lu)", what, frame, g_frame, GetCurrentThreadId());
+}
 // Our copies of UE's depth (two, alternating), the depth's size and format.
 ID3D12Resource* g_depthCopy[2] = {};
 int g_depthNext = 0;
@@ -189,6 +234,7 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from,
 // Back buffer size and format (ReShade's swapchain), and our copy of the picture before the HUD.
 uint32_t g_bbWidth = 0, g_bbHeight = 0;
 format g_bbFormat = format::unknown;
+swapchain* g_rsSwapchain = nullptr;  // ReShade's view of the game's swapchain (its colour space)
 resource g_hudlessTex = {0};
 resource g_uiReadback = {0};  // one row of the HUD layer, for its check
 device* g_hudlessDevice = nullptr;
@@ -292,6 +338,7 @@ void Marker(sl::PCLMarker m) {
 
 // The mode actually used: 3x/4x need multi-frame generation, Dynamic a recent driver.
 int EffectiveMode(int mode) {
+    if (Fsr()) return mode == kOff ? kOff : k2x;  // FSR generates one frame per rendered frame
     if (mode == kDynamic && !g_dynamicSupported) return k2x;
     if (mode >= k2x && mode <= k4x && static_cast<uint32_t>(mode) > g_maxFrames) return static_cast<int>(g_maxFrames);
     return mode;
@@ -328,13 +375,64 @@ void SetFrameGeneration(bool on) {
 
 void CheckUiRow();
 
+// FSR: this frame's inputs for FSR (from the frame's submitted command lists), then configure +
+// prepare (fsrfg.cpp).
+void BeforePresentFsr() {
+    ++g_presents;
+    while (!g_fsrByFrame.empty() && static_cast<int32_t>(g_fsrByFrame.begin()->first - g_frame) < 0)
+        g_fsrByFrame.erase(g_fsrByFrame.begin());  // frames already presented
+    auto found = g_fsrByFrame.find(g_frame);
+    const bool has = g_inputs.Has(g_frame) && found != g_fsrByFrame.end();
+    if (g_tagged) Trace(has ? "present with inputs" : "present WITHOUT inputs", g_frame);
+    g_untagged = has ? 0 : g_untagged + 1;
+    if (g_untagged) ++g_framesUntagged;
+    fsrfg::FrameInputs in;
+    if (has) {
+        const PendingInputs p = found->second;
+        g_fsrByFrame.erase(found);
+        const sl::Constants& c = p.constants;
+        in.depth = p.depth, in.motion = p.motion, in.renderWidth = p.rw, in.renderHeight = p.rh;
+        in.jitterX = c.jitterOffset.x, in.jitterY = c.jitterOffset.y;
+        in.reset = c.reset == sl::Boolean::eTrue;
+        in.cameraNear = c.cameraNear, in.cameraFovY = c.cameraFOV;
+        const float pos[3] = {c.cameraPos.x, c.cameraPos.y, c.cameraPos.z}, up[3] = {c.cameraUp.x, c.cameraUp.y, c.cameraUp.z},
+                    right[3] = {c.cameraRight.x, c.cameraRight.y, c.cameraRight.z},
+                    fwd[3] = {c.cameraFwd.x, c.cameraFwd.y, c.cameraFwd.z};
+        memcpy(in.position, pos, 12), memcpy(in.up, up, 12), memcpy(in.right, right, 12), memcpy(in.forward, fwd, 12);
+    }
+    const bool want = g_set.enabled && g_tagged > 0 && g_untagged < 8;
+    ID3D12Resource* hud = g_hudless.Has(g_frame) && g_hudlessTex.handle ? reinterpret_cast<ID3D12Resource*>(g_hudlessTex.handle) : nullptr;
+    ID3D12Resource* mask = hud && g_hudMask.Has(g_frame) && g_mask.tex.handle ? reinterpret_cast<ID3D12Resource*>(g_mask.tex.handle) : nullptr;
+    CheckUiRow();  // the HUD layer's alpha check (inverted or not), for the mask
+    // HDR or SDR: the swapchain's colour space (UE's SDR back buffer is 10-bit too, so the format
+    // can't tell). Unknown: UE only makes the picture before the HUD with HDR output (not in every
+    // game: True Colors draws its HUD straight in).
+    bool hdr = g_hudlessCount > 0;
+    if (g_rsSwapchain) {
+        const color_space cs = g_rsSwapchain->get_color_space();
+        if (cs != color_space::unknown) hdr = cs == color_space::hdr10_pq || cs == color_space::hdr10_hlg || cs == color_space::scrgb;
+        static int lastCs = -1;
+        if (static_cast<int>(cs) != lastCs) {
+            lastCs = static_cast<int>(cs);
+            Log("frame generation: swapchain colour space %d (%s)", lastCs, hdr ? "HDR" : "SDR");
+        }
+    }
+    fsrfg::BeforePresent(want, has ? &in : nullptr, hud, mask, g_set.fsrHud, g_bbWidth, g_bbHeight,
+                         static_cast<DXGI_FORMAT>(g_bbFormat), hdr);
+    const bool running = fsrfg::Running();
+    if (running != g_fgOn) g_appliedMode = running ? k2x : kOff;
+    g_fgOn = running;
+}
+
 void BeforePresent() {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!g_ready) return;
+    if (Fsr()) return BeforePresentFsr();
     ++g_presents;
     Marker(sl::PCLMarker::eRenderSubmitEnd);
     // A frame now and then misses its inputs (another view, a hitch): frame generation only
     // pauses after several in a row (menus, loading, DLSS off), since each switch can stutter.
+    if (g_tagged) Trace(g_inputs.Has(g_frame) ? "present with inputs" : "present WITHOUT inputs", g_frame);
     g_untagged = g_inputs.Has(g_frame) ? 0 : g_untagged + 1;
     if (g_untagged) ++g_framesUntagged;
     SetFrameGeneration(g_set.enabled && g_tagged > 0 && g_untagged < 8);
@@ -369,6 +467,10 @@ void AfterPresent() {
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_ready) return;
+        if (Fsr()) {
+            ++g_frame;  // FSR has no frame tokens: the next frame starts here
+            return;
+        }
         Marker(sl::PCLMarker::ePresentEnd);
         const uint32_t next = g_frame + 1;
         if (g_sl.getNewFrameToken(token, &next) != sl::Result::eOk || !token) return;
@@ -453,7 +555,7 @@ bool CalledFromStreamline(void* returnAddress) {
     GetModuleFileNameW(mod, path, MAX_PATH);
     const wchar_t* name = wcsrchr(path, L'\\');
     name = name ? name + 1 : path;
-    return _wcsnicmp(name, L"sl.", 3) == 0 || _wcsnicmp(name, L"nvngx", 5) == 0;
+    return _wcsnicmp(name, L"sl.", 3) == 0 || _wcsnicmp(name, L"nvngx", 5) == 0 || _wcsnicmp(name, L"amd_fidelityfx", 14) == 0;
 }
 
 thread_local bool t_creating = false;
@@ -508,8 +610,83 @@ void HookProxyPresent(IDXGISwapChain* sc) {
     Log("frame generation: swapchain created through Streamline%s", hooked ? "" : " (present hook FAILED)");
 }
 
+// ---------------------------------------------------------------- FSR's swapchain
+
+// Loads AMD's runtime (once) when the game creates its swapchain.
+bool EnsureFsr(IUnknown* queueOrDevice) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if (g_initTried) return g_ready;
+    ID3D12CommandQueue* queue = nullptr;
+    if (!queueOrDevice || FAILED(queueOrDevice->QueryInterface(IID_PPV_ARGS(&queue)))) return false;  // not D3D12
+    queue->Release();
+    g_initTried = true;
+    std::string err;
+    if (!fsrfg::Load(err)) {
+        g_status = err;
+        Log("frame generation: %s", err.c_str());
+        return false;
+    }
+    g_ready = true;
+    g_status = "ready";
+    return true;
+}
+
+using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(IUnknown*);
+ReleaseFn g_release = nullptr;
+
+// FSR's swapchain: before the game's last reference goes, frame generation and FSR's swapchain
+// context are shut down (AMD's order). Its references are counted with AddRef + Release (AddRef
+// isn't hooked).
+ULONG STDMETHODCALLTYPE HookRelease(IUnknown* o) {
+    if (o == fsrfg::Proxy()) {
+        o->AddRef();
+        const ULONG now = g_release(o);
+        if (now <= fsrfg::OwnReferences() + 1) {
+            std::lock_guard<std::recursive_mutex> lock(g_mutex);
+            g_upgraded = false;
+            g_fgOn = false;
+            fsrfg::BeforeSwapchainRelease();
+        }
+    }
+    return g_release(o);
+}
+
+void HookFsrProxy(IDXGISwapChain* sc) {
+    const bool hooked = Patch(sc, 8, reinterpret_cast<void*>(&HookPresent), reinterpret_cast<void**>(&g_present)) &&
+                        Patch(sc, 22, reinterpret_cast<void*>(&HookPresent1), reinterpret_cast<void**>(&g_present1)) &&
+                        Patch(sc, 2, reinterpret_cast<void*>(&HookRelease), reinterpret_cast<void**>(&g_release));
+    g_upgraded = hooked;
+    Log("frame generation: swapchain created through FSR%s", hooked ? "" : " (present hook FAILED)");
+}
+
+// FSR creates the real swapchain through the same factory method: t_creating lets that through.
+HRESULT CreateThroughFsr(IUnknown* dev, const std::function<HRESULT(ID3D12CommandQueue*, std::string&)>& create) {
+    ID3D12CommandQueue* queue = nullptr;
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&queue)))) return E_NOINTERFACE;
+    std::string err;
+    t_creating = true;
+    const HRESULT hr = create(queue, err);
+    t_creating = false;
+    queue->Release();
+    if (FAILED(hr)) {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        g_status = err;
+        Log("frame generation: %s: the game's own swapchain is used", err.c_str());
+    }
+    return hr;
+}
+
 HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
     void* caller = _ReturnAddress();
+    if (Fsr()) {
+        if (t_creating || CalledFromStreamline(caller) || !EnsureFsr(dev)) return g_createSwapChain(f, dev, desc, out);
+        const HRESULT hr = CreateThroughFsr(dev, [&](ID3D12CommandQueue* q, std::string& e) {
+            return fsrfg::CreateSwapChain(f, q, desc, out, e);
+        });
+        if (FAILED(hr)) return g_createSwapChain(f, dev, desc, out);
+        HookFsrProxy(*out);
+        return hr;
+    }
     if (t_creating || CalledFromStreamline(caller) || !EnsureStreamline(dev)) return g_createSwapChain(f, dev, desc, out);
     void* proxy = UpgradeFactory(f);
     if (!proxy) return g_createSwapChain(f, dev, desc, out);
@@ -525,6 +702,16 @@ HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DX
 HRESULT STDMETHODCALLTYPE HookCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                             const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* output, IDXGISwapChain1** out) {
     void* caller = _ReturnAddress();
+    if (Fsr()) {
+        if (t_creating || CalledFromStreamline(caller) || output || !EnsureFsr(dev))
+            return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
+        const HRESULT hr = CreateThroughFsr(dev, [&](ID3D12CommandQueue* q, std::string& e) {
+            return fsrfg::CreateSwapChainForHwnd(f, q, hwnd, desc, fs, out, e);
+        });
+        if (FAILED(hr)) return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
+        HookFsrProxy(*out);
+        return hr;
+    }
     if (t_creating || CalledFromStreamline(caller) || !EnsureStreamline(dev))
         return g_createForHwnd(f, dev, hwnd, desc, fs, output, out);
     void* proxy = UpgradeFactory(f);
@@ -688,12 +875,18 @@ void OnDestroyDevice(device* dev) {
     if (g_hudlessTex.handle && g_hudlessDevice == dev) dev->destroy_resource(g_hudlessTex), g_hudlessTex = {0};
     if (g_uiReadback.handle && g_hudlessDevice == dev) dev->destroy_resource(g_uiReadback), g_uiReadback = {0};
     if (g_hudlessDevice == dev) DestroyMask(dev);
+    if (Fsr() && g_ready) fsrfg::Shutdown();  // normally done already, with the swapchain
     ReleaseDepthCopies();
     g_pendingInputs.clear(), g_pendingHud.clear();
     if (!g_ready) return;
     g_ready = false;
-    g_sl.shutdown();
     g_status = "shut down";
+    if (Fsr()) {
+        g_upgraded = false;
+        Log("frame generation: FSR shut down");
+        return;
+    }
+    g_sl.shutdown();
     Log("frame generation: Streamline shut down");
 }
 
@@ -871,6 +1064,80 @@ bool RecordMask(command_list* cl, resource ui) {
 // buffer and then blends the HUD over that copy. The copy's source is the picture before the
 // HUD: it's copied into our own texture and handed to frame generation, so the HUD isn't warped
 // with the scene. (Without that copy, as in SDR, frame generation runs without it.)
+// Hands one frame's depth, motion vectors and camera to frame <frame>: kept for FSR (taken right
+// before that frame's Present), or tagged for Streamline. <list>: the command list they were
+// recorded in (when handed over at recording), or null (at submission).
+void GiveInputs(uint32_t frame, const PendingInputs& p, ID3D12GraphicsCommandList* list) {
+    Trace(list ? "inputs recorded" : "inputs submitted", frame);
+    // Two sets for one frame (a hitch, another view): Streamline refuses different constants for
+    // the same frame, so the first one stays.
+    if (frame == UINT32_MAX || g_inputs.Has(frame)) return void(++g_tagWhy["second set in a frame, skipped"]);
+    if (Fsr()) {
+        g_fsrByFrame[frame] = p;
+        while (g_fsrByFrame.size() > 4) g_fsrByFrame.erase(g_fsrByFrame.begin());
+        g_inputs.Set(frame);
+        ++g_tagsSet;
+        if (++g_tagged == 1) Log("frame generation: first frame's inputs (%ux%u)", p.rw, p.rh);
+        return;
+    }
+    sl::FrameToken* token = TokenFor(frame);
+    if (!token) return void(++g_tagWhy["no frame token"]);
+    sl::Result r = g_sl.setConstants(p.constants, *token, sl::ViewportHandle(0));
+    if (r != sl::Result::eOk) {
+        static int logged = 0;
+        if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
+        return;
+    }
+    sl::Resource depthRes(sl::ResourceType::eTex2d, p.depth, nullptr, nullptr, kDepthReadState);
+    sl::Resource motionRes(sl::ResourceType::eTex2d, p.motion, nullptr, nullptr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const sl::Extent extent{0, 0, p.rw, p.rh};
+    // The back buffer itself comes from the swapchain; only its extent (all of it) is passed.
+    const sl::Extent bbExtent{0, 0, g_bbWidth, g_bbHeight};
+    const sl::ResourceTag tags[3] = {
+        sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+        sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+        sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &bbExtent)};
+    r = g_sl.setTagForFrame(*token, sl::ViewportHandle(0), tags, g_bbWidth ? 3 : 2, list);
+    if (r != sl::Result::eOk) {
+        static int logged = 0;
+        if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
+        return;
+    }
+    g_inputs.Set(frame);
+    ++g_tagsSet;
+    if (++g_tagged == 1) Log("frame generation: first frame tagged %s (%ux%u)", list ? "at recording" : "at submission", p.rw, p.rh);
+}
+
+// Hands the picture before the HUD (and the HUD mask if <mask>) to frame <frame>.
+void GiveHud(uint32_t frame, bool mask, ID3D12GraphicsCommandList* list) {
+    if (frame == UINT32_MAX || !g_hudlessTex.handle) return;
+    mask = mask && g_mask.tex.handle;
+    if (Fsr()) {
+        g_hudless.Set(frame), ++g_hudlessCount;
+        if (mask) g_hudMask.Set(frame), ++g_uiCount;
+        return;
+    }
+    sl::FrameToken* token = TokenFor(frame);
+    if (!token) return;
+    const sl::Extent extent{0, 0, g_bbWidth, g_bbHeight};
+    sl::Resource res(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_hudlessTex.handle), nullptr, nullptr,
+                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sl::Resource maskRes(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_mask.tex.handle), nullptr, nullptr,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const sl::ResourceTag tags[2] = {
+        sl::ResourceTag(&res, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent),
+        sl::ResourceTag(&maskRes, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent)};
+    const uint32_t n = mask ? 2 : 1;
+    if (g_sl.setTagForFrame(*token, sl::ViewportHandle(0), tags, n, list) == sl::Result::eOk) {
+        g_hudless.Set(frame);
+        ++g_hudlessCount;
+        if (n == 2) ++g_uiCount;
+    } else {
+        static int logged = 0;
+        if (logged++ < 10) Log("frame generation: tagging the pre-HUD picture failed");
+    }
+}
+
 bool OnCopyResource(command_list* cl, resource src, resource dst) {
     if (!g_ready || !g_set.enabled || !g_bbWidth) return false;
     device* dev = cl->get_device();
@@ -881,7 +1148,7 @@ bool OnCopyResource(command_list* cl, resource src, resource dst) {
     const resource_desc dd = dev->get_resource_desc(dst);
     if (dd.texture.width != g_bbWidth || dd.texture.height != g_bbHeight || dd.texture.format != g_bbFormat) return false;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!g_token) return false;
+    if (!Frames()) return false;
     if (!g_hudlessTex.handle) {
         const resource_desc d(g_bbWidth, g_bbHeight, 1, 1, g_bbFormat, 1, memory_heap::default_,
                               resource_usage::shader_resource | resource_usage::copy_dest);
@@ -898,14 +1165,17 @@ bool OnCopyResource(command_list* cl, resource src, resource dst) {
     cl->barrier(g_hudlessTex, resource_usage::shader_resource, resource_usage::copy_dest);
     cl->copy_resource(src, g_hudlessTex);
     cl->barrier(g_hudlessTex, resource_usage::copy_dest, resource_usage::shader_resource);
-    PendingHud& pending = g_pendingHud[cl->get_native()];  // tagged when the list is submitted
-    pending.mask = false;
+    bool mask = false;
     FgList* l = cl->get_private_data<FgList>();
     const resource ui = l ? l->uiLayer : resource{0};
     if (ui.handle) {
         if (g_uiCheck == UiCheck::pending && g_presents > 120) ReadUiRow(cl, ui);  // past the first frames
-        if ((g_uiCheck == UiCheck::usable || g_uiCheck == UiCheck::inverted) && RecordMask(cl, ui)) pending.mask = true;
+        if ((g_uiCheck == UiCheck::usable || g_uiCheck == UiCheck::inverted) && RecordMask(cl, ui)) mask = true;
     }
+    if (kTagAtRecord)
+        GiveHud(TargetFrame(g_hudless), mask, reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()));
+    else
+        g_pendingHud[cl->get_native()].mask = mask;  // handed over when the list is submitted
     return false;  // the game's copy goes ahead
 }
 
@@ -920,11 +1190,13 @@ void OnInitSwapchain(swapchain* sc, bool) {
         DestroyMask(g_hudlessDevice);
     }
     g_bbWidth = d.texture.width, g_bbHeight = d.texture.height, g_bbFormat = d.texture.format;
+    g_rsSwapchain = sc;
 }
 
-void OnDestroySwapchain(swapchain*, bool) {
+void OnDestroySwapchain(swapchain* sc, bool) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     g_bbWidth = 0;  // no pre-HUD copies until the swapchain is back
+    if (g_rsSwapchain == sc) g_rsSwapchain = nullptr;
 }
 
 }  // namespace
@@ -965,7 +1237,7 @@ void FrameGenSetCamera(const float* view, int clipToPrevClipOffset) {
 void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12Resource* motion, unsigned rw,
                  unsigned rh, float jitterX, float jitterY, bool reset) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!g_ready || !g_set.enabled || !g_token) return;
+    if (!g_ready || !g_set.enabled || !Frames()) return;
     if (!g_camera.valid) return void(++g_tagWhy["no camera"]);
     const Camera& cam = g_camera;
     sl::Constants c{};
@@ -1017,9 +1289,11 @@ void FrameGenTag(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, ID3D12R
     list->ResourceBarrier(2, before);
     list->CopyResource(copy, depth);
     list->ResourceBarrier(2, after);
-    PendingInputs& pending = g_pendingInputs[reinterpret_cast<uint64_t>(list)];  // tagged when the list is submitted
-    pending.constants = c;
-    pending.depth = copy, pending.motion = motion, pending.rw = rw, pending.rh = rh;
+    PendingInputs inputs;
+    inputs.constants = c;
+    inputs.depth = copy, inputs.motion = motion, inputs.rw = rw, inputs.rh = rh;
+    if (kTagAtRecord) GiveInputs(TargetFrame(g_inputs), inputs, list);
+    else g_pendingInputs[reinterpret_cast<uint64_t>(list)] = inputs;  // handed over when the list is submitted
 }
 
 namespace {
@@ -1032,7 +1306,7 @@ void OnExecute(command_queue*, command_list* cl) {
     auto in = g_pendingInputs.find(key);
     auto hud = g_pendingHud.find(key);
     if (in == g_pendingInputs.end() && hud == g_pendingHud.end()) return;
-    if (!g_ready || !g_token) {
+    if (!g_ready || !Frames()) {
         if (in != g_pendingInputs.end()) g_pendingInputs.erase(in);
         if (hud != g_pendingHud.end()) g_pendingHud.erase(hud);
         return;
@@ -1040,59 +1314,12 @@ void OnExecute(command_queue*, command_list* cl) {
     if (in != g_pendingInputs.end()) {
         const PendingInputs p = in->second;
         g_pendingInputs.erase(in);
-        // Two frames' lists before one Present (a hitch): Streamline takes one set per frame and
-        // refuses different constants for the same frame, so the first one stays.
-        if (g_inputs.Has(g_frame)) {
-            ++g_tagWhy["second set in a frame, skipped"];
-        } else {
-            sl::Result r = g_sl.setConstants(p.constants, *g_token, sl::ViewportHandle(0));
-            if (r != sl::Result::eOk) {
-                static int logged = 0;
-                if (logged++ < 10) Log("frame generation: slSetConstants failed: %d", static_cast<int>(r));
-            } else {
-                sl::Resource depthRes(sl::ResourceType::eTex2d, p.depth, nullptr, nullptr, kDepthReadState);
-                sl::Resource motionRes(sl::ResourceType::eTex2d, p.motion, nullptr, nullptr,
-                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                const sl::Extent extent{0, 0, p.rw, p.rh};
-                // The back buffer itself comes from the swapchain; only its extent (all of it) is passed.
-                const sl::Extent bbExtent{0, 0, g_bbWidth, g_bbHeight};
-                const sl::ResourceTag tags[3] = {
-                    sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-                    sl::ResourceTag(&motionRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-                    sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &bbExtent)};
-                r = g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, g_bbWidth ? 3 : 2, nullptr);
-                if (r != sl::Result::eOk) {
-                    static int logged = 0;
-                    if (logged++ < 10) Log("frame generation: slSetTagForFrame failed: %d", static_cast<int>(r));
-                } else {
-                    g_inputs.Set(g_frame);
-                    ++g_tagsSet;
-                    if (++g_tagged == 1) Log("frame generation: first frame tagged at submission (%ux%u)", p.rw, p.rh);
-                }
-            }
-        }
+        GiveInputs(g_frame, p, nullptr);
     }
     if (hud != g_pendingHud.end()) {
-        const PendingHud h = hud->second;
+        const bool mask = hud->second.mask;
         g_pendingHud.erase(hud);
-        const sl::Extent extent{0, 0, g_bbWidth, g_bbHeight};
-        sl::Resource res(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_hudlessTex.handle), nullptr, nullptr,
-                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        sl::Resource maskRes(sl::ResourceType::eTex2d, reinterpret_cast<void*>(g_mask.tex.handle), nullptr, nullptr,
-                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        const sl::ResourceTag tags[2] = {
-            sl::ResourceTag(&res, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-            sl::ResourceTag(&maskRes, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent)};
-        const uint32_t n = h.mask && g_mask.tex.handle ? 2 : 1;
-        if (g_hudlessTex.handle &&
-            g_sl.setTagForFrame(*g_token, sl::ViewportHandle(0), tags, n, nullptr) == sl::Result::eOk) {
-            g_hudless.Set(g_frame);
-            ++g_hudlessCount;
-            if (n == 2) ++g_uiCount;
-        } else {
-            static int logged = 0;
-            if (logged++ < 10) Log("frame generation: tagging the pre-HUD picture failed");
-        }
+        GiveHud(g_frame, mask, nullptr);
     }
 }
 
@@ -1107,7 +1334,13 @@ void RegisterFrameGen() {
     if (g_set.mode < kOff || g_set.mode >= kModeCount) g_set.mode = kOff;
     reshade::get_config_value(nullptr, RD_PRODUCT, "ObjectSeparation", g_set.separation);
     if (!(g_set.separation >= 1 && g_set.separation <= 100)) g_set.separation = 40;
-    g_set.enabled = g_set.mode != kOff && kTsrMapped;  // needs DLSS, which needs TSR mapped
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FrameGenTech", g_set.tech);
+    if (g_set.tech < 0 || g_set.tech >= kTechCount) g_set.tech = kTechDlss;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "FsrHudMode", g_set.fsrHud);
+    if (g_set.fsrHud < 0 || g_set.fsrHud >= fsrfg::kHudModeCount) g_set.fsrHud = fsrfg::kHudComposite;
+    g_activeTech = g_set.tech;  // until the next launch
+    g_set.enabled = g_set.mode != kOff && kTsrMapped;  // needs the upscaler, which needs TSR mapped
+    if (g_set.enabled) Log("frame generation: %s, %s", kTechNames[g_activeTech], kModeNames[EffectiveMode(g_set.mode)]);
     reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
     reshade::register_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
@@ -1138,28 +1371,52 @@ void UnregisterFrameGen() {
 
 void DrawFrameGenSettings() {
     ImGui::SeparatorText("Frame generation");
-    int mode = g_set.mode;
-    ImGui::SetNextItemWidth(ControlWidth());
+    // One list for both technologies (two dropdowns let the technology be missed): Off, DLSS 2x / 3x /
+    // 4x / Dynamic (FrameGenTech 0, FrameGenMode 1-4), FSR 2x (FrameGenTech 1, FrameGenMode 1).
+    static const char* const kChoices[] = {"Off", "DLSS 2x", "DLSS 3x", "DLSS 4x", "DLSS Dynamic", "FSR 2x"};
+    int choice = g_set.mode == kOff ? 0 : g_set.tech == kTechFsr ? 5 : g_set.mode;
     ImGui::BeginDisabled(!kTsrMapped);
-    const bool picked = ImGui::Combo("Mode##framegen", &mode, kModeNames, kModeCount);
+    ImGui::SetNextItemWidth(ControlWidth());
+    const bool picked = ImGui::Combo("Frame generation##framegen", &choice, kChoices, 6);
     ImGui::EndDisabled();
     if (picked) {
-        g_set.mode = mode;
-        g_set.enabled = mode != kOff;
-        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenMode", mode);
-        Log("settings: frame generation %s", kModeNames[mode]);
+        if (choice == 5) g_set.tech = kTechFsr, g_set.mode = k2x;
+        else if (choice > 0) g_set.tech = kTechDlss, g_set.mode = choice;
+        else g_set.mode = kOff;
+        g_set.enabled = g_set.mode != kOff;
+        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenMode", g_set.mode);
+        reshade::set_config_value(nullptr, RD_PRODUCT, "FrameGenTech", g_set.tech);
+        Log("settings: frame generation %s", kChoices[choice]);
     }
-    Help("NVIDIA DLSS Frame Generation: 2x, 3x and 4x add 1, 2 or 3 generated frames per rendered frame. Dynamic "
-         "picks the multiplier to reach the display's refresh rate.\n\nNeeds DLSS on, and runs in game only (not "
-         "in menus). Switching on from Off takes a game restart; the multipliers switch right away.");
+    Help("DLSS: NVIDIA's frame generation, RTX 40 and 50 series. 2x, 3x and 4x add 1, 2 or 3 generated frames per "
+         "rendered frame (3x and 4x need an RTX 50); Dynamic picks the multiplier to reach the display's refresh "
+         "rate. Uses NVIDIA Reflex for low latency.\n\nFSR: AMD's frame generation, any DirectX 12 graphics card "
+         "(FSR 4 on Radeon RX 9000 under Windows 11, FSR 3.1 elsewhere). 2x; no Reflex, so a little more "
+         "latency.\n\nWorks with either upscaler, needs the upscaler on, and runs in game only (not in menus). "
+         "Switching it on, or between DLSS and FSR, takes a game restart; DLSS's multipliers switch right away.");
 
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (g_set.enabled && !g_ready && !g_initTried && !g_factoryHooked)
             ImGui::TextColored(kWarn, "Restart the game to start frame generation.");
-        if (g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
+        else if (g_set.enabled && g_set.tech != g_activeTech)
+            ImGui::TextColored(kWarn, "Restart the game to switch to %s frame generation.", g_set.tech == kTechFsr ? "FSR" : "DLSS");
+        if (!Fsr() && g_capsKnown && EffectiveMode(g_set.mode) != g_set.mode)
             ImGui::TextColored(kWarn, "%s isn't supported here, so %s.", kModeNames[g_set.mode],
                                kModeNames[EffectiveMode(g_set.mode)]);
+    }
+    if (g_set.tech == kTechFsr) {  // the object separation is DLSS's; the HUD protection FSR's
+        ImGui::SetNextItemWidth(ControlWidth());
+        if (ImGui::Combo("HUD protection", &g_set.fsrHud, kFsrHudNames, fsrfg::kHudModeCount)) {
+            reshade::set_config_value(nullptr, RD_PRODUCT, "FsrHudMode", g_set.fsrHud);
+            Log("settings: FSR HUD protection %s", kFsrHudNames[g_set.fsrHud]);
+        }
+        Help("How FSR keeps the HUD and subtitles from warping (HDR only: in SDR the game draws its HUD straight "
+             "onto the screen).\n\nComposite: FSR compares the screen with a copy that differs only where the "
+             "game's HUD layer has something. Recommended.\nPicture before the HUD: the game's own copy from "
+             "before the HUD; in this game it also differs around characters, which then jitter.\nOff: the HUD "
+             "is generated like the rest of the picture and may wobble.\n\nSwitches right away.");
+        return;
     }
 
     float sep = g_set.separation;
@@ -1183,7 +1440,8 @@ std::string FrameGenHeadline(bool* warn) {
                                               : std::string("Frame generation: restart the game to start it");
     }
     if (!g_upgraded) return (*warn = true), "Frame generation not running: the game's swapchain wasn't handed over";
-    if (!g_fgOn) return "Frame generation paused (DLSS off, menu or loading)";
+    if (!g_fgOn) return "Frame generation paused (upscaler off, menu or loading)";
+    if (Fsr()) return fsrfg::Version() + " on: 2x";
     char buf[96];
     snprintf(buf, sizeof(buf), "Frame generation %s: %u frames per rendered frame",
              g_appliedMode >= 0 && g_appliedMode < kModeCount ? kModeNames[g_appliedMode] : "on",
@@ -1195,7 +1453,14 @@ void DrawFrameGenStatus() {
     ImGui::SeparatorText("Frame generation");
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!g_ready) {
-        ImGui::TextDisabled("Streamline: %s", g_status.c_str());
+        ImGui::TextDisabled("%s: %s", Fsr() ? "FSR" : "Streamline", g_status.c_str());
+        return;
+    }
+    if (Fsr()) {
+        ImGui::TextDisabled("%s: %s, %s", fsrfg::Version().c_str(), fsrfg::Status().c_str(), g_fgOn ? "2x" : "paused");
+        ImGui::TextDisabled("Game frames %llu: with depth and motion %llu, with the picture before the HUD %llu",
+                            static_cast<unsigned long long>(g_presents.load()), static_cast<unsigned long long>(g_tagged.load()),
+                            static_cast<unsigned long long>(g_hudlessCount.load()));
         return;
     }
     const unsigned st = static_cast<unsigned>(g_state.status);

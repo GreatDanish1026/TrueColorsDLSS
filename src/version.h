@@ -3,4 +3,4 @@
 
 #define RD_PRODUCT "TrueColorsDLSS"  // add-on name, log file name, ReShade.ini section
 #define RD_GAME "Life is Strange: True Colors"
-#define RD_VERSION "1.0.0"
+#define RD_VERSION "1.1.0"

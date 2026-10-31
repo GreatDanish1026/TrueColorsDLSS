@@ -258,6 +258,13 @@ void EndFrame() {
     }
 }
 
+void ReleaseFeatures() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (auto& [out, f] : g_features)
+        if (f.handle) g_retired.push_back({f.handle, g_frame});
+    g_features.clear();
+}
+
 void Shutdown() {
     std::lock_guard<std::mutex> lock(g_mutex);
     for (auto& [out, f] : g_features)

@@ -33,6 +33,9 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
 // Once per presented frame: releases replaced features the GPU is done with.
 void EndFrame();
 
+// Releases every feature (after the GPU is done with them): when FSR takes over.
+void ReleaseFeatures();
+
 void Shutdown();
 
 // A line for the overlay ("DLSS 310.x, Quality mode ...").
