@@ -7,7 +7,7 @@
 #             laid out as in the game folder, README, LICENSE, THIRD_PARTY_NOTICES and the licences.
 # The NVIDIA runtime comes from third_party\streamline\bin\x64: bin\x64 of NVIDIA's Streamline
 # SDK release 2.14.16 (github.com/NVIDIA-RTX/Streamline/releases), which also carries
-# nvngx_dlss.dll 310.9.16. AMD's FSR runtime (amd_fidelityfx_loader_dx12.dll,
+# nvngx_dlss.dll and nvngx_dlssd.dll (Ray Reconstruction) 310.9.16. AMD's FSR runtime (amd_fidelityfx_loader_dx12.dll,
 # amd_fidelityfx_upscaler_dx12.dll, amd_fidelityfx_framegeneration_dx12.dll) comes from
 # Kits\FidelityFX\signedbin of AMD's FSR SDK 2.4.0
 # (github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases), copied to third_party\fidelityfx\bin.
@@ -39,6 +39,8 @@ $cmd = @(
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kComposeCs /Fh `"$obj\compose_cs.h`" `"$root\src\compose.hlsl`" >nul",
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kUiAlphaCs /Fh `"$obj\ui_alpha_cs.h`" `"$root\src\ui_alpha.hlsl`" >nul",
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kHudComposeCs /Fh `"$obj\hud_compose_cs.h`" `"$root\src\hud_compose.hlsl`" >nul",
+    "fxc /nologo /T cs_5_1 /E main /O3 /Vn kGuideCs /Fh `"$obj\guide_cs.h`" `"$root\src\guide.hlsl`" >nul",
+    "fxc /nologo /T cs_5_1 /E main /O3 /Vn kGuideViewCs /Fh `"$obj\guide_view_cs.h`" `"$root\src\guide_view.hlsl`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
      "/I `"$obj`" /I `"$root\third_party\imgui`" /I`"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" /I `"$root\third_party\streamline\include`" " +
      "/I `"$root\third_party\fidelityfx\api\include`" /I `"$root\third_party\fidelityfx\upscalers\include`" /I `"$root\third_party\fidelityfx\framegeneration\include`" " +
@@ -52,7 +54,7 @@ Write-Host "Built $addon"
 # NVIDIA's runtime, all signed: DLSS next to the exe, Streamline (frame generation) in Win64\streamline.
 $sl = "$root\third_party\streamline\bin\x64"
 $slFiles = "sl.interposer.dll", "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll"
-foreach ($f in @("nvngx_dlss.dll") + $slFiles) {
+foreach ($f in @("nvngx_dlss.dll", "nvngx_dlssd.dll") + $slFiles) {
     if (($Install -or $Package) -and -not (Test-Path "$sl\$f")) { throw "$f not found in $sl (unzip NVIDIA's Streamline 2.14.16 release there)" }
 }
 
@@ -67,6 +69,7 @@ foreach ($f in $ffxFiles) {
 function Copy-Runtime([string]$dest) {
     Copy-Item $addon $dest -Force
     Copy-Item "$sl\nvngx_dlss.dll" $dest -Force
+    Copy-Item "$sl\nvngx_dlssd.dll" $dest -Force  # Ray Reconstruction
     foreach ($f in $ffxFiles) { Copy-Item "$ffx\$f" $dest -Force }
     New-Item -ItemType Directory -Force "$dest\streamline" | Out-Null
     foreach ($f in $slFiles) { Copy-Item "$sl\$f" "$dest\streamline" -Force }

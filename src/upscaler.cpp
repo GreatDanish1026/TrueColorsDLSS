@@ -1,4 +1,4 @@
-// Replaces the game's TAA with DLSS (Life is Strange: True Colors, UE 4.25).
+// Replaces the game's TAA with DLSS, DLSS Ray Reconstruction or FSR (Life is Strange: True Colors, UE 4.25).
 //
 // UE 4's TAA is one compute pass with every input bound (common.hpp, kTaaMain): scene colour t1
 // (translucency already composited), depth t2, engine velocity t3, output u0; root CBV 4 is the
@@ -46,6 +46,8 @@
 #include "motion_cs.h"  // kMotionCs: motion.hlsl compiled by build.ps1
 #include "tint_cs.h"    // kTintCs: tint.hlsl (mask debug view)
 #include "compose_cs.h"  // kComposeCs: compose.hlsl (translucency)
+#include "guide_cs.h"       // kGuideCs: guide.hlsl (Ray Reconstruction guides from the G-buffer)
+#include "guide_view_cs.h"  // kGuideViewCs: guide_view.hlsl (guide debug view)
 #include "version.h"
 
 using namespace reshade::api;
@@ -69,7 +71,7 @@ struct Settings {
     // (saved: FsrVelocityFactor, FsrSwaying, FsrShadingChange).
     bool fsrJitterFlip = false, fsrDebug = false;
     float fsrVelocity = 1.0f, fsrSwaying = -1.0f / 3, fsrShading = 1.0f;
-    int preset = 11;       // NVSDK_NGX_DLSS_Hint_Render_Preset_K (transformer)
+    int preset = dlss::kPresetAuto;  // DLSS model: Automatic, or NVSDK_NGX_DLSS_Hint_Render_Preset_* (0 = NVIDIA's)
     int mode = 0;          // DlssMode: 0 leaves the render resolution to the game's Resolution Scale
     int maskMode = 0;      // motion.hlsl MaskMode: 0 off, 2 moving objects (UE 4 has no animation flag)
     bool showMask = false;  // debug tint, not saved
@@ -77,7 +79,16 @@ struct Settings {
     // camera reprojection); 1 square-root (UE 5.2) and 2 ignored stay for diagnosis. Not saved.
     int objectMode = 0;
     int transMask = 1;  // translucency in the bias mask: 0 off, 1 partial, 2 full
+    // DLSS Ray Reconstruction in place of Super Resolution (ini RayReconstruction): the game's
+    // ray tracing denoisers go off while it runs. rrPreset: NVSDK_NGX_RayReconstruction_Hint_Render_Preset_*
+    // (ini RrModel, 0 = NVIDIA's default). guideView: debug view of one guide (not saved).
+    bool rr = false;
+    int rrPreset = 0;
+    int guideView = 0;
 } g_set;
+
+const char* const kGuideViewNames[] = {"Off", "Diffuse albedo", "Specular albedo", "Normals", "Roughness"};
+constexpr int kGuideViewCount = 5;
 
 const char* const kTransMaskNames[] = {"Off", "Partial (recommended)", "Full"};
 constexpr int kTransMaskCount = 3;
@@ -100,12 +111,15 @@ void LoadSettings() {
     if (!(g_set.fsrSwaying >= -1 && g_set.fsrSwaying <= 1)) g_set.fsrSwaying = -1.0f / 3;
     reshade::get_config_value(nullptr, RD_PRODUCT, "FsrShadingChange", g_set.fsrShading);
     if (!(g_set.fsrShading >= 0 && g_set.fsrShading <= 2)) g_set.fsrShading = 1.0f;
-    reshade::get_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "DlssModel", g_set.preset);
     reshade::get_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
     reshade::get_config_value(nullptr, RD_PRODUCT, "AnimationMask", g_set.maskMode);
     if (g_set.maskMode != 0 && g_set.maskMode != 2) g_set.maskMode = 0;
     reshade::get_config_value(nullptr, RD_PRODUCT, "TranslucencyMask", g_set.transMask);
     if (g_set.transMask < 0 || g_set.transMask >= kTransMaskCount) g_set.transMask = 1;
+    reshade::get_config_value(nullptr, RD_PRODUCT, "RayReconstruction", g_set.rr);
+    reshade::get_config_value(nullptr, RD_PRODUCT, "RrModel", g_set.rrPreset);
+    if (g_set.rrPreset != 0 && (g_set.rrPreset < 4 || g_set.rrPreset > 6)) g_set.rrPreset = 0;
     if (!kTsrMapped) g_set.enabled = false;  // the upscaler's passes aren't known in this game yet
     if (g_set.mode < 0 || g_set.mode >= 6) g_set.mode = 0;
 }
@@ -117,10 +131,12 @@ void SaveSettings() {
     reshade::set_config_value(nullptr, RD_PRODUCT, "FsrVelocityFactor", g_set.fsrVelocity);
     reshade::set_config_value(nullptr, RD_PRODUCT, "FsrSwaying", g_set.fsrSwaying);
     reshade::set_config_value(nullptr, RD_PRODUCT, "FsrShadingChange", g_set.fsrShading);
-    reshade::set_config_value(nullptr, RD_PRODUCT, "Preset", g_set.preset);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "DlssModel", g_set.preset);
     reshade::set_config_value(nullptr, RD_PRODUCT, "DlssMode", g_set.mode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "AnimationMask", g_set.maskMode);
     reshade::set_config_value(nullptr, RD_PRODUCT, "TranslucencyMask", g_set.transMask);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "RayReconstruction", g_set.rr);
+    reshade::set_config_value(nullptr, RD_PRODUCT, "RrModel", g_set.rrPreset);
 }
 
 // ---------------------------------------------------------------- per command list bindings
@@ -459,7 +475,21 @@ struct MotionState {
     pipeline composePipe = {0};
     bool composeFailed = false;
     uint64_t composed = 0, copied = 0;
+    // Ray Reconstruction guides (guide.hlsl) and their debug view (guide_view.hlsl).
+    pipeline_layout guideLayout = {0};
+    pipeline guidePipe = {0};
+    bool guideFailed = false;
+    pipeline_layout guideViewLayout = {0};
+    pipeline guideViewPipe = {0};
+    bool guideViewFailed = false;
 } g_motion;
+
+// The G-buffer render targets of a base pass (Ray Reconstruction guides), by texture size.
+struct GBufferSet {
+    resource a = {0}, b = {0}, c = {0};
+    format fa = format::unknown, fb = format::unknown, fc = format::unknown;  // the render target views' formats
+};
+std::map<uint64_t, GBufferSet> g_gbuffers;
 
 // ---------------------------------------------------------------- motion vectors
 
@@ -550,6 +580,9 @@ bool CreateMotionPipeline(device* dev) {
     return true;
 }
 
+// MotionTexture slots of the Ray Reconstruction guides.
+constexpr int kSlotDiffuse = 10, kSlotSpecular = 11, kSlotNormal = 12;
+
 // Our own render-resolution texture of <fmt> (rg16f motion vectors, r8 mask, rgba16f colour).
 resource MotionTexture(device* dev, uint32_t w, uint32_t h, format fmt = format::r16g16_float, int slot = 0) {
     for (const MotionState::Texture& t : g_motion.textures)
@@ -560,6 +593,9 @@ resource MotionTexture(device* dev, uint32_t w, uint32_t h, format fmt = format:
     const resource_desc d(w, h, 1, 1, fmt, 1, memory_heap::default_,
                           resource_usage::shader_resource | resource_usage::unordered_access);
     const char* what = fmt == format::r8_unorm             ? (slot ? "translucency mask" : "animation mask")
+                       : slot == kSlotDiffuse              ? "diffuse albedo"
+                       : slot == kSlotSpecular             ? "specular albedo"
+                       : slot == kSlotNormal               ? "normal + roughness"
                        : fmt == format::r16g16b16a16_float ? "composed colour"
                                                            : "motion vector";
     if (!dev->create_resource(d, nullptr, resource_usage::shader_resource_non_pixel, &t.tex)) {
@@ -589,6 +625,10 @@ void LogOnce(int& count, const char* fmt, uint32_t a, uint32_t b) {
     Log(fmt, a, b);
 }
 
+// UE's velocity buffer: rg16unorm in True Colors (4.25), rgba16unorm in The Quarry (4.26) when
+// the engine writes velocity in the base pass. motion.hlsl reads only .xy, so both work.
+bool IsVelocityFormat(format f) { return f == format::r16g16_unorm || f == format::r16g16b16a16_unorm; }
+
 // UE 4.25's View uniform buffer (FViewUniformShaderParameters), byte offsets from the capture:
 // ClipToPrevClip 1952 (unjittered), TemporalAAJitter 2016 (this frame's, last frame's; clip
 // units), ViewRectMin 2064, ViewSizeAndInvSize 2080. ViewToClip (448) holds the jitter in its
@@ -604,7 +644,7 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
     device* dev = cl->get_device();
     if (!velocity.handle) return Why("motion: no velocity"), resource{0};
     const resource_desc dd = dev->get_resource_desc(depth), vd = dev->get_resource_desc(velocity);
-    if (dd.texture.format != format::r32_g8_typeless || vd.texture.format != format::r16g16_unorm ||
+    if (dd.texture.format != format::r32_g8_typeless || !IsVelocityFormat(vd.texture.format) ||
         vd.texture.width < size[0] || vd.texture.height < size[1]) {
         LogOnce(badFormat, "motion: depth format %u, velocity format %u: TAA kept for this view",
                 static_cast<uint32_t>(dd.texture.format), static_cast<uint32_t>(vd.texture.format));
@@ -616,7 +656,7 @@ resource ComputeMotion(command_list* cl, ListState& s, resource depth, resource 
     const resource mask = MotionTexture(dev, dd.texture.width, dd.texture.height, format::r8_unorm);
     if (!tex.handle || !mask.handle) return Why("motion: no texture (limit)"), resource{0};
     const resource_view srvs[2] = {View(dev, depth, format::r32_float_x8_uint, false),
-                                   View(dev, velocity, format::r16g16_unorm, false)};
+                                   View(dev, velocity, vd.texture.format, false)};
     const resource_view uavs[2] = {View(dev, tex, format::r16g16_float, true), View(dev, mask, format::r8_unorm, true)};
     if (!srvs[0].handle || !srvs[1].handle || !uavs[0].handle || !uavs[1].handle) return Why("motion: views"), resource{0};
 
@@ -709,6 +749,8 @@ void TintMask(command_list* cl, resource output, resource mask, unsigned renderW
 
 void OnDestroyResource(device* dev, resource r) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    for (auto g = g_gbuffers.begin(); g != g_gbuffers.end();)  // a G-buffer texture the game let go
+        g = g->second.a == r || g->second.b == r || g->second.c == r ? g_gbuffers.erase(g) : std::next(g);
     for (int kind = 0; kind < 2; ++kind) {
         auto it = g_motion.views.find(std::make_pair(r.handle, kind));
         if (it == g_motion.views.end()) continue;
@@ -808,6 +850,222 @@ bool Compose(command_list* cl, ListState& s) {
     s.chain.mask = mask;
     if (++g_motion.composed == 1) Log("translucency: blended into DLSS's input");
     return true;
+}
+
+// ---------------------------------------------------------------- Ray Reconstruction guides
+//
+// UE 4.25's base pass draws into scene colour + GBufferA (rgb10a2: world normal) + GBufferB (8-bit:
+// metallic, specular, roughness, shading model) + GBufferC (8-bit: base colour) [+ GBufferD/E,
+// velocity]. That render target set is remembered per size when it's bound; at the TAA, the
+// G-buffer of the TAA's size becomes Ray Reconstruction's guides (guide.hlsl). The G-buffer is taken
+// to be in a shader resource state by then (the lighting passes read it).
+
+std::string g_rrError;                     // why Ray Reconstruction isn't running (overlay)
+std::atomic<uint64_t> g_rrEvaluated{0}, g_rrLastPresent{0}, g_presents{0};
+bool g_lastWasRr = false;
+
+bool Is8BitColor(format f) {
+    return f == format::b8g8r8a8_unorm || f == format::b8g8r8a8_unorm_srgb || f == format::b8g8r8a8_typeless ||
+           f == format::r8g8b8a8_unorm || f == format::r8g8b8a8_unorm_srgb || f == format::r8g8b8a8_typeless;
+}
+bool IsNormalFormat(format f) { return f == format::r10g10b10a2_unorm || f == format::r10g10b10a2_typeless; }
+
+void OnBindRenderTargets(command_list* cl, uint32_t count, const resource_view* rtvs, resource_view) {
+    if (count < 4 || !g_set.enabled || !g_set.rr) return;
+    device* dev = cl->get_device();
+    format f[4];
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (!rtvs[i].handle) return;
+        f[i] = dev->get_resource_view_desc(rtvs[i]).format;
+    }
+    if (!IsHdrColor(f[0]) || !IsNormalFormat(f[1]) || !Is8BitColor(f[2]) || !Is8BitColor(f[3])) {
+        static std::atomic<int> logged{0};  // what else binds 4+ targets (a base pass we don't recognise?)
+        if (logged++ < 6) {
+            const resource_desc d = dev->get_resource_desc(dev->get_resource_from_view(rtvs[0]));
+            Log("render targets not taken as a G-buffer: %u targets %ux%u, formats %u %u %u %u", count, d.texture.width,
+                d.texture.height, static_cast<uint32_t>(f[0]), static_cast<uint32_t>(f[1]), static_cast<uint32_t>(f[2]),
+                static_cast<uint32_t>(f[3]));
+        }
+        return;
+    }
+    const resource a = dev->get_resource_from_view(rtvs[1]), b = dev->get_resource_from_view(rtvs[2]),
+                   c = dev->get_resource_from_view(rtvs[3]);
+    if (!a.handle || !b.handle || !c.handle) return;
+    const resource_desc ad = dev->get_resource_desc(a);
+    const uint64_t key = (static_cast<uint64_t>(ad.texture.width) << 32) | ad.texture.height;
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    GBufferSet& g = g_gbuffers[key];
+    if (g.a == a && g.b == b && g.c == c) return;
+    g.a = a, g.b = b, g.c = c, g.fa = f[1], g.fb = f[2], g.fc = f[3];
+    static int logged = 0;
+    if (logged++ < 8)
+        Log("G-buffer %ux%u found (%u render targets): A format %u, B %u, C %u", ad.texture.width, ad.texture.height,
+            count, static_cast<uint32_t>(f[1]), static_cast<uint32_t>(f[2]), static_cast<uint32_t>(f[3]));
+}
+
+bool CreateGuidePipelines(device* dev) {
+    if (g_motion.guidePipe.handle && g_motion.guideViewPipe.handle) return true;
+    if (g_motion.guideFailed) return false;
+    constant_range c = {};
+    c.count = 20;
+    c.visibility = shader_stage::all_compute;
+    descriptor_range srv = {};
+    srv.count = 3;
+    srv.visibility = shader_stage::all_compute;
+    srv.type = descriptor_type::shader_resource_view;
+    descriptor_range uav = {};
+    uav.count = 3;
+    uav.visibility = shader_stage::all_compute;
+    uav.type = descriptor_type::unordered_access_view;
+    const pipeline_layout_param params[3] = {pipeline_layout_param(c), pipeline_layout_param(srv), pipeline_layout_param(uav)};
+    shader_desc cs = {};
+    cs.code = kGuideCs;
+    cs.code_size = sizeof(kGuideCs);
+    pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
+
+    constant_range vc = {};
+    vc.count = 8;
+    vc.visibility = shader_stage::all_compute;
+    descriptor_range vsrv = srv, vuav = uav;
+    vsrv.count = 1, vuav.count = 1;
+    const pipeline_layout_param vparams[3] = {pipeline_layout_param(vc), pipeline_layout_param(vsrv), pipeline_layout_param(vuav)};
+    shader_desc vcs = {};
+    vcs.code = kGuideViewCs;
+    vcs.code_size = sizeof(kGuideViewCs);
+    pipeline_subobject vsub = {pipeline_subobject_type::compute_shader, 1, &vcs};
+
+    if (!dev->create_pipeline_layout(3, params, &g_motion.guideLayout) ||
+        !dev->create_pipeline(g_motion.guideLayout, 1, &sub, &g_motion.guidePipe) ||
+        !dev->create_pipeline_layout(3, vparams, &g_motion.guideViewLayout) ||
+        !dev->create_pipeline(g_motion.guideViewLayout, 1, &vsub, &g_motion.guideViewPipe)) {
+        g_motion.guideFailed = true;
+        g_rrError = "couldn't create the Ray Reconstruction guide shader";
+        Log("%s", g_rrError.c_str());
+        return false;
+    }
+    Log("Ray Reconstruction guide shader created");
+    return true;
+}
+
+// UE 4.25's View buffer: TranslatedWorldToView at byte 192 (camera
+// at the origin, so no translation), ViewToClip 448 (jittered), ViewToClipNoAA 512.
+constexpr int kViewTranslatedWorldToView = 192, kViewToClip = 448, kViewToClipNoAA = 512;
+
+// Checks those matrices are what they should be: a rotation without translation, and the same
+// projection with and without jitter. Logs the first failures.
+bool ViewMatricesOk(const float* v) {
+    const float* w = v + kViewTranslatedWorldToView / 4;
+    const float* p = v + kViewToClip / 4;
+    const float* n = v + kViewToClipNoAA / 4;
+    bool ok = w[3] == 0 && w[7] == 0 && w[11] == 0 && std::fabs(w[15] - 1) < 1e-4f;
+    for (int i = 0; i < 3 && ok; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            const float d = w[i * 4] * w[j * 4] + w[i * 4 + 1] * w[j * 4 + 1] + w[i * 4 + 2] * w[j * 4 + 2];
+            if (std::fabs(d - (i == j ? 1.0f : 0.0f)) > 2e-3f) ok = false;
+        }
+        if (std::fabs(w[12 + i]) > 10) ok = false;  // translated world: the camera is at the origin
+    }
+    ok = ok && Near(n[0], p[0]) && Near(n[5], p[5]) && n[8] == 0 && n[9] == 0 && n[11] == 1 && n[14] == p[14];
+    static int logged = 0;
+    if (logged < (ok ? 1 : 4)) {
+        ++logged;
+        Log("View matrices for Ray Reconstruction %s: TranslatedWorldToView rows (%.3f %.3f %.3f %.3f) (%.3f %.3f %.3f %.3f) "
+            "(%.3f %.3f %.3f %.3f) (%.3f %.3f %.3f %.3f); ViewToClipNoAA x %.4f y %.4f jitter row %.5f %.5f %.3f %.3f, "
+            "near %.3f (jittered: %.5f %.5f)",
+            ok ? "ok" : "NOT as expected", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11],
+            w[12], w[13], w[14], w[15], n[0], n[5], n[8], n[9], n[10], n[11], n[14], p[8], p[9]);
+    }
+    return ok;
+}
+
+// The G-buffer's shader resource format: the render target's own (sRGB decodes), typeless as unorm.
+format SrvFormat(format f) { return format_to_default_typed(f, 0); }
+
+// Records guide.hlsl (in the TAA's command list) and puts the game's state back. The guides are
+// textures of the G-buffer's size; <size> is the view's.
+bool BuildGuides(command_list* cl, ListState& s, resource depth, const float size[2], const float* v, resource out[3]) {
+    device* dev = cl->get_device();
+    const resource_desc dd = dev->get_resource_desc(depth);
+    const uint64_t key = (static_cast<uint64_t>(dd.texture.width) << 32) | dd.texture.height;
+    auto it = g_gbuffers.find(key);
+    if (it == g_gbuffers.end()) {
+        g_rrError = "G-buffer not found yet (no base pass of the render size seen)";
+        return false;
+    }
+    const GBufferSet& g = it->second;
+    if (!CreateGuidePipelines(dev)) return false;
+    const uint32_t w = dd.texture.width, h = dd.texture.height;
+    out[0] = MotionTexture(dev, w, h, format::r8g8b8a8_unorm, kSlotDiffuse);
+    out[1] = MotionTexture(dev, w, h, format::r8g8b8a8_unorm, kSlotSpecular);
+    out[2] = MotionTexture(dev, w, h, format::r16g16b16a16_float, kSlotNormal);
+    if (!out[0].handle || !out[1].handle || !out[2].handle) {
+        g_rrError = "couldn't create the guide textures";
+        return false;
+    }
+    const resource_view srvs[3] = {View(dev, g.a, SrvFormat(g.fa), false), View(dev, g.b, SrvFormat(g.fb), false),
+                                   View(dev, g.c, SrvFormat(g.fc), false)};
+    const resource_view uavs[3] = {View(dev, out[0], format::r8g8b8a8_unorm, true),
+                                   View(dev, out[1], format::r8g8b8a8_unorm, true),
+                                   View(dev, out[2], format::r16g16b16a16_float, true)};
+    for (const resource_view& x : srvs)
+        if (!x.handle) return g_rrError = "couldn't read the G-buffer (views)", false;
+    for (const resource_view& x : uavs)
+        if (!x.handle) return g_rrError = "guide texture views failed", false;
+
+    float params[20] = {};
+    const float* m = v + kViewTranslatedWorldToView / 4;
+    for (int r = 0; r < 3; ++r) memcpy(&params[r * 4], m + r * 4, 3 * sizeof(float));
+    params[12] = size[0], params[13] = size[1], params[14] = 1 / size[0], params[15] = 1 / size[1];
+    params[16] = v[kViewToClipNoAA / 4], params[17] = v[kViewToClipNoAA / 4 + 5];
+
+    const resource_usage from[3] = {resource_usage::shader_resource_non_pixel, resource_usage::shader_resource_non_pixel,
+                                    resource_usage::shader_resource_non_pixel};
+    const resource_usage to[3] = {resource_usage::unordered_access, resource_usage::unordered_access,
+                                  resource_usage::unordered_access};
+    cl->barrier(3, out, from, to);
+    cl->bind_pipeline(pipeline_stage::all_compute, g_motion.guidePipe);
+    cl->push_constants(shader_stage::all_compute, g_motion.guideLayout, 0, 0, 20, params);
+    descriptor_table_update u = {};
+    u.count = 3;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = srvs;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.guideLayout, 1, u);
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = uavs;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.guideLayout, 2, u);
+    cl->dispatch((static_cast<uint32_t>(size[0]) + 7) / 8, (static_cast<uint32_t>(size[1]) + 7) / 8, 1);
+    cl->barrier(3, out, to, from);
+    Restore(cl, s);
+    return true;
+}
+
+// Debug view: draws guide <which> (1 diffuse, 2 specular, 3 normals, 4 roughness) over <output>
+// (unordered access state).
+void ShowGuide(command_list* cl, resource output, const resource guides[3], int which, unsigned renderW, unsigned renderH) {
+    device* dev = cl->get_device();
+    if (!g_motion.guideViewPipe.handle || which < 1 || which > 4) return;
+    const resource g = guides[which == 1 ? 0 : which == 2 ? 1 : 2];
+    const format gf = which <= 2 ? format::r8g8b8a8_unorm : format::r16g16b16a16_float;
+    const resource_desc od = dev->get_resource_desc(output);
+    const resource_view srv = View(dev, g, gf, false);
+    const resource_view uav = View(dev, output, od.texture.format, true);
+    if (!srv.handle || !uav.handle) return;
+    float params[8] = {static_cast<float>(od.texture.width), static_cast<float>(od.texture.height),
+                       static_cast<float>(renderW) / od.texture.width, static_cast<float>(renderH) / od.texture.height};
+    const uint32_t mode = which <= 2 ? 1 : which == 3 ? 2 : 3;
+    memcpy(&params[4], &mode, 4);
+    cl->bind_pipeline(pipeline_stage::all_compute, g_motion.guideViewPipe);
+    cl->push_constants(shader_stage::all_compute, g_motion.guideViewLayout, 0, 0, 8, params);
+    descriptor_table_update u = {};
+    u.count = 1;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = &srv;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.guideViewLayout, 1, u);
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = &uav;
+    cl->push_descriptors(shader_stage::all_compute, g_motion.guideViewLayout, 2, u);
+    cl->dispatch((od.texture.width + 7) / 8, (od.texture.height + 7) / 8, 1);
+    cl->barrier(output, resource_usage::unordered_access, resource_usage::unordered_access);
 }
 
 // ---------------------------------------------------------------- DLSS
@@ -917,6 +1175,17 @@ bool OnTaa(command_list* cl, ListState& s) {
         ++g_skipped;
         return false;
     }
+    // Ray Reconstruction: guides from the G-buffer; Super Resolution this frame if they can't be made.
+    bool useRr = false;
+    resource guides[3] = {{0}, {0}, {0}};
+    if (backend == kDlss && g_set.rr) {
+        std::string why;
+        if (!dlss::RrAvailable(&why)) g_rrError = why;
+        else if (!ViewMatricesOk(v)) g_rrError = "the View buffer's camera matrices aren't as expected (see the log)";
+        else if (BuildGuides(cl, s, depth, size, v, guides)) useRr = true, g_rrError.clear();
+        if (!useRr) Why("ray reconstruction: not running (super resolution instead)");
+    }
+
     const unsigned rw = static_cast<unsigned>(size[0]), rh = static_cast<unsigned>(size[1]);
     g_lastJitter[0] = jitter[0], g_lastJitter[1] = jitter[1];
     if (g_resetAll) g_resetByOutput.clear(), g_resetAll = false;
@@ -942,6 +1211,15 @@ bool OnTaa(command_list* cl, ListState& s) {
     in.motionScaleX = 1, in.motionScaleY = 1;  // motion.hlsl writes previous minus current in pixels
     in.reset = reset;
     in.preset = g_set.preset;
+    if (useRr) {
+        in.rr = true;
+        in.rrPreset = g_set.rrPreset;
+        in.diffuseAlbedo = reinterpret_cast<ID3D12Resource*>(guides[0].handle);
+        in.specularAlbedo = reinterpret_cast<ID3D12Resource*>(guides[1].handle);
+        in.normalRoughness = reinterpret_cast<ID3D12Resource*>(guides[2].handle);
+        in.worldToView = v + kViewTranslatedWorldToView / 4;
+        in.viewToClip = v + kViewToClipNoAA / 4;
+    }
     bool ok = false;
     if (backend == kDlss) {
         ok = dlss::Evaluate(reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()), in, err);
@@ -967,6 +1245,17 @@ bool OnTaa(command_list* cl, ListState& s) {
     if (ok && g_set.showMask) {
         cl->bind_descriptor_tables(shader_stage::all_compute, s.compute.layout, 0, 0, nullptr);  // ReShade's heaps back
         TintMask(cl, output, mask, rw, rh);
+    }
+    if (ok && useRr && g_set.guideView > 0) {
+        cl->bind_descriptor_tables(shader_stage::all_compute, s.compute.layout, 0, 0, nullptr);
+        ShowGuide(cl, output, guides, g_set.guideView, rw, rh);
+    }
+    if (ok) {
+        if (useRr) {
+            if (++g_rrEvaluated == 1) Log("DLSS Ray Reconstruction: first frame evaluated (%ux%u -> %ux%u)", rw, rh, out.texture.width, out.texture.height);
+            g_rrLastPresent = g_presents.load();
+        }
+        g_lastWasRr = useRr;
     }
     Restore(cl, s);
     if (!ok) {
@@ -1014,7 +1303,7 @@ bool IsTaa(command_list* cl, ListState& s) {
     for (uint32_t i = 0; i < 6; ++i) d[i] = dev->get_resource_desc(r[i]);
     const resource_desc od = dev->get_resource_desc(out);
     const bool match = d[0].texture.width == 1 && d[0].texture.height == 1 && IsHdrColor(d[1].texture.format) &&
-                       d[2].texture.format == format::r32_g8_typeless && d[3].texture.format == format::r16g16_unorm &&
+                       d[2].texture.format == format::r32_g8_typeless && IsVelocityFormat(d[3].texture.format) &&
                        IsHdrColor(d[5].texture.format) && IsHdrColor(od.texture.format) &&
                        od.texture.width >= d[1].texture.width && od.texture.height >= d[1].texture.height;
     if (verdict.size() < 256) verdict[s.computeId] = match;
@@ -1045,6 +1334,11 @@ void OnDestroyDevice(device* dev) {
     if (g_motion.pipe.handle) dev->destroy_pipeline(g_motion.pipe);
     if (g_motion.tintPipe.handle) dev->destroy_pipeline(g_motion.tintPipe);
     if (g_motion.composePipe.handle) dev->destroy_pipeline(g_motion.composePipe);
+    if (g_motion.guidePipe.handle) dev->destroy_pipeline(g_motion.guidePipe);
+    if (g_motion.guideLayout.handle) dev->destroy_pipeline_layout(g_motion.guideLayout);
+    if (g_motion.guideViewPipe.handle) dev->destroy_pipeline(g_motion.guideViewPipe);
+    if (g_motion.guideViewLayout.handle) dev->destroy_pipeline_layout(g_motion.guideViewLayout);
+    g_gbuffers.clear();
     if (g_motion.composeLayout.handle) dev->destroy_pipeline_layout(g_motion.composeLayout);
     if (g_motion.tintLayout.handle) dev->destroy_pipeline_layout(g_motion.tintLayout);
     if (g_motion.layout.handle) dev->destroy_pipeline_layout(g_motion.layout);
@@ -1086,6 +1380,68 @@ struct Resolution {
 
 cvars::SinksFn g_origSinks = nullptr;
 
+// UE 4.25's ray tracing denoisers (names from the game's exe). Ray Reconstruction needs the raw,
+// noisy ray-traced lighting, so they go to 0 while it runs and back to the game's values (and
+// priorities) after. Set on the game thread like the render resolution.
+const wchar_t* const kDenoiserNames[] = {L"r.Shadow.Denoiser",          L"r.Reflections.Denoiser",
+                                         L"r.AmbientOcclusion.Denoiser", L"r.DiffuseIndirect.Denoiser",
+                                         L"r.RayTracing.GlobalIllumination.Denoiser", L"r.RayTracing.SkyLight.Denoiser"};
+constexpr int kDenoiserCount = 6;
+struct Denoisers {
+    void* var[kDenoiserCount] = {};
+    int32_t game[kDenoiserCount] = {};
+    uint32_t priority[kDenoiserCount] = {};
+    bool overriding = false;  // game thread
+    std::atomic<bool> wantOff{false};
+    std::atomic<int> off{0};  // how many are off (overlay)
+} g_dn;
+
+void FindDenoisers() {
+    for (int i = 0; i < kDenoiserCount; ++i) {
+        g_dn.var[i] = cvars::FindVariable(g_res.manager, kDenoiserNames[i]);
+        int32_t value = -1;
+        if (g_dn.var[i] && !cvars::GetInt(g_dn.var[i], value)) g_dn.var[i] = nullptr;
+        Log("Ray Reconstruction: %ls %s (%d)", kDenoiserNames[i], g_dn.var[i] ? "found" : "not found", value);
+    }
+}
+
+// Game thread, about every 15 frames.
+void DenoiserTick() {
+    if (g_dn.wantOff) {
+        int n = 0;
+        for (int i = 0; i < kDenoiserCount; ++i) {
+            int32_t now = 0;
+            if (!g_dn.var[i] || !cvars::GetInt(g_dn.var[i], now)) continue;
+            if (!g_dn.overriding) {
+                g_dn.game[i] = now;
+                g_dn.priority[i] = cvars::GetFlags(g_dn.var[i]) & cvars::kPriorityMask;
+            } else if (now != 0) {
+                g_dn.game[i] = now;  // the game set it again
+                Log("Ray Reconstruction: the game set %ls to %d again", kDenoiserNames[i], now);
+            }
+            if (now != 0) cvars::Set(g_dn.var[i], L"0");
+            ++n;
+        }
+        if (!g_dn.overriding)
+            Log("Ray Reconstruction: %d ray tracing denoisers off (game's: shadows %d, reflections %d, AO %d, diffuse "
+                "indirect %d, GI %d, sky light %d)", n, g_dn.game[0], g_dn.game[1], g_dn.game[2], g_dn.game[3],
+                g_dn.game[4], g_dn.game[5]);
+        g_dn.overriding = true;
+        g_dn.off = n;
+    } else if (g_dn.overriding) {
+        for (int i = 0; i < kDenoiserCount; ++i) {
+            if (!g_dn.var[i]) continue;
+            wchar_t text[16];
+            swprintf(text, 16, L"%d", g_dn.game[i]);
+            cvars::Set(g_dn.var[i], text);
+            cvars::RestorePriority(g_dn.var[i], g_dn.priority[i]);
+        }
+        g_dn.overriding = false;
+        g_dn.off = 0;
+        Log("Ray Reconstruction off: ray tracing denoisers back to the game's values");
+    }
+}
+
 bool SetFloat(void* var, float v) {
     wchar_t text[32];
     swprintf(text, 32, L"%.3f", v);
@@ -1095,6 +1451,7 @@ bool SetFloat(void* var, float v) {
 // Game thread, about every 15 frames.
 void ResolutionTick() {
     if (++g_res.ticks % 15 != 0) return;
+    DenoiserTick();
     const float want = g_res.want.load();
     float now = 0;
     int32_t up = 0;
@@ -1162,6 +1519,7 @@ bool FindResolutionCvars() {
     }
     g_res.hooked = true;
     Log("DLSS mode: r.ScreenPercentage found (now %g); game-thread hook in place", value);
+    FindDenoisers();
     return true;
 }
 
@@ -1195,6 +1553,8 @@ void UpdateResolution() {
     if (!g_res.manager && !g_res.failed && (want || g_set.enabled) && !FindResolutionCvars()) g_res.failed = true;
     LogVelocitySettings();
     g_res.want = want ? kDlssModePercent[g_set.mode] : 0.0f;
+    // Denoisers off while Ray Reconstruction ran in the last couple of seconds.
+    g_dn.wantOff = g_set.enabled && g_set.rr && g_rrEvaluated.load() > 0 && g_presents.load() - g_rrLastPresent.load() < 120;
 }
 
 void LogStats() {
@@ -1227,6 +1587,7 @@ void LogStats() {
 }
 
 void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+    ++g_presents;
     LogStats();
     UpdateResolution();
     HWND fg = GetForegroundWindow();
@@ -1260,6 +1621,7 @@ void RegisterUpscaler() {
     reshade::register_event<reshade::addon_event::push_descriptors>(&OnPushDescriptors);
     reshade::register_event<reshade::addon_event::push_constants>(&OnPushConstants);
     reshade::register_event<reshade::addon_event::dispatch>(&OnDispatch);
+    reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
     reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
     reshade::register_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
     reshade::register_event<reshade::addon_event::present>(&OnPresent);
@@ -1275,6 +1637,7 @@ void UnregisterUpscaler() {
     reshade::unregister_event<reshade::addon_event::push_descriptors>(&OnPushDescriptors);
     reshade::unregister_event<reshade::addon_event::push_constants>(&OnPushConstants);
     reshade::unregister_event<reshade::addon_event::dispatch>(&OnDispatch);
+    reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnBindRenderTargets);
     reshade::unregister_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
     reshade::unregister_event<reshade::addon_event::destroy_resource>(&OnDestroyResource);
     reshade::unregister_event<reshade::addon_event::present>(&OnPresent);
@@ -1283,17 +1646,25 @@ void UnregisterUpscaler() {
 void SaveAndLog() {
     g_resetAll = true;
     SaveSettings();
-    Log("settings: upscaler %s (%s), DLSS preset %d, FSR sharpness %.2f, mode %s", g_set.enabled ? "on" : "off",
-        kBackendNames[g_set.backend], g_set.preset, g_set.sharpness,
-        kDlssModeNames[g_set.mode >= 0 && g_set.mode < kDlssModeCount ? g_set.mode : 0]);
+    Log("settings: upscaler %s (%s), DLSS preset %d, FSR sharpness %.2f, mode %s, Ray Reconstruction %s (preset %d)",
+        g_set.enabled ? "on" : "off", kBackendNames[g_set.backend], g_set.preset, g_set.sharpness,
+        kDlssModeNames[g_set.mode >= 0 && g_set.mode < kDlssModeCount ? g_set.mode : 0], g_set.rr ? "on" : "off",
+        g_set.rrPreset);
 }
 
-// Preset ids (NVSDK_NGX_DLSS_Hint_Render_Preset_*) and their names in the overlay.
-const char* const kPresetNames[] = {"NVIDIA default", "J", "K (recommended)", "L", "M"};
-const int kPresetIds[] = {0, 10, 11, 12, 13};
-constexpr int kPresetCount = 5;
+// DLSS models offered (NVSDK_NGX_DLSS_Hint_Render_Preset_*; dlss::kPresetAuto = per render scale).
+const char* const kModelNames[] = {"Automatic (recommended)", "K (transformer)", "J (transformer)",
+                                   "L (transformer 2, DLSS 4.5)", "M (transformer 2, DLSS 4.5)", "NVIDIA's default"};
+const int kModelIds[] = {dlss::kPresetAuto, 11, 10, 12, 13, 0};
+constexpr int kModelCount = 6;
+int ModelIndex(int id) {
+    for (int i = 0; i < kModelCount; ++i)
+        if (kModelIds[i] == id) return i;
+    return 0;
+}
 
 const char* PresetName(int id) {
+    if (id == dlss::kPresetAuto) return "Automatic";
     if (id == 0) return "NVIDIA default";
     static char buf[8];
     snprintf(buf, sizeof(buf), "%c", id > 0 && id < 26 ? static_cast<char>('A' + id - 1) : '?');
@@ -1321,13 +1692,40 @@ void DrawUpscalerSettings() {
     if (g_res.failed) ImGui::TextColored(kWarn, "Render resolution: %s", g_res.error.c_str());
 
     if (shown != kFsr) {
-        int cur = 2;
-        for (int i = 0; i < kPresetCount; ++i)
-            if (kPresetIds[i] == g_set.preset) cur = i;
+        int cur = ModelIndex(g_set.preset);
         ImGui::SetNextItemWidth(ControlWidth());
-        if (ImGui::Combo("DLSS model", &cur, kPresetNames, kPresetCount)) g_set.preset = kPresetIds[cur], SaveAndLog();
-        Help("DLSS's model (preset). K is NVIDIA's transformer model, sharpest in motion. A DLSS override set in the "
-             "NVIDIA App takes precedence over this.");
+        if (ImGui::Combo("DLSS model", &cur, kModelNames, kModelCount)) g_set.preset = kModelIds[cur], SaveAndLog();
+        Help("Which DLSS model upscales. Automatic follows NVIDIA's recommendation for the render "
+             "resolution: K from 100% down to Balanced, M at Performance (50%), L at Ultra Performance "
+             "(33%). K, J, L or M use that model at every resolution; L and M (DLSS 4.5's "
+             "second-generation transformer) cost more, especially on RTX 20 and 30 cards. NVIDIA's "
+             "default leaves it to the driver. A DLSS override set in the NVIDIA App takes precedence.");
+
+        if (ImGui::Checkbox("Ray Reconstruction", &g_set.rr)) SaveAndLog();
+        Help("NVIDIA's DLSS Ray Reconstruction: one AI model cleans up the ray-traced effects AND upscales, in place\n"
+             "of the game's ray tracing denoisers and DLSS Super Resolution. Sharper, steadier ray-traced\n"
+             "reflections, shadows and ambient occlusion, with less smearing in motion; costs a bit more than Super\n"
+             "Resolution. The game's denoisers are switched off while it runs and come back when it's off.\n"
+             "Only makes a difference with ray-traced effects on (TrueColorsTweaks' ray tracing options).");
+        if (g_set.rr) {
+            static const char* const kRrNames[] = {"NVIDIA's default", "D (transformer)", "E (latest transformer)",
+                                                   "F (RR 2)"};
+            static const int kRrIds[] = {0, 4, 5, 6};
+            int cur = g_set.rrPreset == 4 ? 1 : g_set.rrPreset == 5 ? 2 : g_set.rrPreset == 6 ? 3 : 0;
+            ImGui::SetNextItemWidth(ControlWidth());
+            if (ImGui::Combo("Ray Reconstruction model", &cur, kRrNames, 4)) g_set.rrPreset = kRrIds[cur], SaveAndLog();
+            Help("Which Ray Reconstruction model runs: D (transformer), E (newer transformer) or F (NVIDIA's\n"
+                 "second-generation Ray Reconstruction model). NVIDIA's default lets the driver choose. The DLSS\n"
+                 "model choice above doesn't apply while Ray Reconstruction is on.\n\n"
+                 "A Ray Reconstruction model override set in the NVIDIA App (DLSS Override - Model Presets) takes\n"
+                 "precedence over this choice: set it to \"Use app default\" there for this choice to apply.");
+            std::string err;
+            {
+                std::lock_guard<std::recursive_mutex> lock(g_mutex);
+                err = g_rrError;
+            }
+            if (!err.empty() && g_set.enabled) ImGui::TextColored(kWarn, "Ray Reconstruction: %s", err.c_str());
+        }
     }
     if (shown != kDlss) {
         ImGui::SetNextItemWidth(ControlWidth());
@@ -1354,6 +1752,14 @@ void DrawUpscalerAdvanced() {
          "characters, slightly less stable fine detail on them. FSR takes it much more strongly than DLSS (noise).");
     ImGui::Checkbox("Show the mask in red", &g_set.showMask);
     Help("Tints the masked pixels red. For testing; off at each launch.");
+
+    ImGui::SeparatorText("Ray Reconstruction guides");
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::Combo("Show guide", &g_set.guideView, kGuideViewNames, kGuideViewCount))
+        Log("diagnosis: show guide %s", kGuideViewNames[g_set.guideView]);
+    Help("Shows one of the surface pictures Ray Reconstruction gets from the game in place of the image: surface\n"
+         "colour (diffuse albedo), reflectivity (specular albedo), normals or roughness. For checking they are\n"
+         "read right; only while Ray Reconstruction runs. Off at each launch.");
 
     ImGui::SeparatorText("History");
     if (ImGui::Button("Reset upscaler history")) g_resetAll = true;
@@ -1403,7 +1809,12 @@ std::string UpscalerHeadline(bool* warn) {
     if (!g_error.empty()) return (*warn = true), name + ": " + g_error;
     if (!g_lastRender[0] || !g_lastBackend) return "Upscaler on: starts with the next game frame";
     char buf[160];
-    if (g_lastBackend == kDlss)
+    if (g_lastBackend == kDlss && g_lastWasRr)
+        snprintf(buf, sizeof(buf), "DLSS Ray Reconstruction on: %ux%u -> %ux%u", g_lastRender[0], g_lastRender[1],
+                 g_lastOutput[0], g_lastOutput[1]);
+    else if (g_lastBackend == kDlss && g_set.rr && !g_rrError.empty())
+        return (*warn = true), "DLSS on, Ray Reconstruction not running: " + g_rrError;
+    else if (g_lastBackend == kDlss)
         snprintf(buf, sizeof(buf), "DLSS on: %ux%u -> %ux%u, model %s", g_lastRender[0], g_lastRender[1],
                  g_lastOutput[0], g_lastOutput[1], PresetName(g_set.preset));
     else
@@ -1426,6 +1837,10 @@ void DrawUpscalerStatus() {
                                                                       : "not found (colour copied without it)");
         if (g_res.hooked)
             ImGui::TextDisabled("Screen percentage: %s", g_res.want.load() > 0 ? "set by the Render resolution choice" : "the game's");
+        if (g_set.rr)
+            ImGui::TextDisabled("Ray Reconstruction frames %llu; ray tracing denoisers: %s",
+                                static_cast<unsigned long long>(g_rrEvaluated.load()),
+                                g_dn.off.load() ? "off (Ray Reconstruction denoises)" : "the game's");
     }
 }
 

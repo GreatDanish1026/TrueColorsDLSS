@@ -10,8 +10,10 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 #include <nvsdk_ngx_helpers_d3d.h>
+#include <nvsdk_ngx_helpers_dlssd_d3d.h>
 
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -28,12 +30,16 @@ bool g_initTried = false, g_ready = false;
 std::string g_initError;
 NVSDK_NGX_Parameter* g_params = nullptr;
 std::string g_status = "not started";
+bool g_rrAvailable = false;
+std::string g_rrWhy = "DLSS not started";
 
 // One DLSS feature (and so one history) per output: the game renders more than one TSR view.
 struct Feature {
     NVSDK_NGX_Handle* handle = nullptr;
     unsigned renderW = 0, renderH = 0, outW = 0, outH = 0;
     int preset = -1;
+    bool rr = false;
+    int rrPreset = -1;
     NVSDK_NGX_PerfQuality_Value quality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
     uint64_t lastFrame = 0;  // last frame it was evaluated in
 };
@@ -107,6 +113,39 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Inputs& in, Feature& f
         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,    NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality};
     for (const char* k : presetKeys) NVSDK_NGX_Parameter_SetUI(g_params, k, static_cast<unsigned>(in.preset));
+    const int flags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+                      NVSDK_NGX_DLSS_Feature_Flags_DepthInverted | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+
+    if (in.rr) {
+        const char* rrKeys[] = {NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA,
+                                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality,
+                                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
+                                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance,
+                                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance,
+                                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality};
+        for (const char* k : rrKeys) NVSDK_NGX_Parameter_SetUI(g_params, k, static_cast<unsigned>(in.rrPreset));
+        NVSDK_NGX_DLSSD_Create_Params dp = {};
+        dp.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+        dp.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed;  // roughness in the normals' w
+        dp.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;
+        dp.InWidth = in.renderWidth;
+        dp.InHeight = in.renderHeight;
+        dp.InTargetWidth = in.outputWidth;
+        dp.InTargetHeight = in.outputHeight;
+        dp.InPerfQualityValue = q;
+        dp.InFeatureCreateFlags = flags;
+        const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSSD_EXT(list, 1, 1, &f.handle, g_params, &dp);
+        if (NVSDK_NGX_FAILED(r)) {
+            f.handle = nullptr;
+            error = "Ray Reconstruction feature creation failed (" + ResultText(r) + ")";
+            return false;
+        }
+        f.renderW = in.renderWidth, f.renderH = in.renderHeight, f.outW = in.outputWidth, f.outH = in.outputHeight;
+        f.preset = in.preset, f.quality = q, f.rr = true, f.rrPreset = in.rrPreset;
+        rd::Log("DLSS Ray Reconstruction feature created: %ux%u -> %ux%u, %s mode, RR preset %d", in.renderWidth,
+                in.renderHeight, in.outputWidth, in.outputHeight, QualityName(q), in.rrPreset);
+        return true;
+    }
 
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth = in.renderWidth;
@@ -114,8 +153,7 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Inputs& in, Feature& f
     cp.Feature.InTargetWidth = in.outputWidth;
     cp.Feature.InTargetHeight = in.outputHeight;
     cp.Feature.InPerfQualityValue = q;
-    cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    cp.InFeatureCreateFlags = flags;
     const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(list, 1, 1, &f.handle, g_params, &cp);
     if (NVSDK_NGX_FAILED(r)) {
         f.handle = nullptr;
@@ -123,7 +161,7 @@ bool CreateFeature(ID3D12GraphicsCommandList* list, const Inputs& in, Feature& f
         return false;
     }
     f.renderW = in.renderWidth, f.renderH = in.renderHeight, f.outW = in.outputWidth, f.outH = in.outputHeight;
-    f.preset = in.preset, f.quality = q;
+    f.preset = in.preset, f.quality = q, f.rr = false, f.rrPreset = -1;
     rd::Log("DLSS feature created: %ux%u -> %ux%u, %s mode, preset %d (%zu output sizes)",
             in.renderWidth, in.renderHeight, in.outputWidth, in.outputHeight, QualityName(q),
             in.preset, g_features.size());
@@ -181,10 +219,35 @@ bool Init(ID3D12Device* device, std::string& error) {
     g_ready = true;
     g_status = "ready";
     rd::Log("NGX ready, DLSS Super Resolution available");
+
+    // Ray Reconstruction: nvngx_dlssd.dll next to the exe (and in streamline\, where NGX also looks).
+    int rrAvailable = 0, rrNeedsUpdate = 0;
+    NVSDK_NGX_Parameter_GetI(g_params, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rrAvailable);
+    NVSDK_NGX_Parameter_GetI(g_params, NVSDK_NGX_Parameter_SuperSamplingDenoising_NeedsUpdatedDriver, &rrNeedsUpdate);
+    g_rrAvailable = rrAvailable != 0;
+    g_rrWhy = g_rrAvailable  ? ""
+              : rrNeedsUpdate ? "Ray Reconstruction needs a newer NVIDIA driver"
+                              : "Ray Reconstruction not available: is nvngx_dlssd.dll next to the game exe?";
+    rd::Log("DLSS Ray Reconstruction %s", g_rrAvailable ? "available" : g_rrWhy.c_str());
     return true;
 }
 
-bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& error) {
+bool RrAvailable(std::string* why) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (why) *why = g_rrWhy;
+    return g_ready && g_rrAvailable;
+}
+
+// The model for Automatic, by render scale: K down to Balanced (58%), M around Performance (50%),
+// L at Ultra Performance (33%). (The DLSS mode NGX reports can't tell: its ranges overlap.)
+int AutoPreset(unsigned renderW, unsigned outputW) {
+    const float r = outputW ? static_cast<float>(renderW) / outputW : 1.0f;
+    return r >= 0.54f ? 11 : r >= 0.42f ? 13 : 12;
+}
+
+bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& requested, std::string& error) {
+    Inputs in = requested;
+    if (in.preset == kPresetAuto) in.preset = AutoPreset(in.renderWidth, in.outputWidth);
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_ready) {
         error = g_initError.empty() ? "DLSS not started" : g_initError;
@@ -211,12 +274,59 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in, std::string& er
     }
     Feature& f = it->second;
     f.lastFrame = g_frame;
+    if (in.rr && !g_rrAvailable) {
+        error = g_rrWhy;
+        return false;
+    }
     const bool fresh = !f.handle || in.renderWidth != f.renderW || in.renderHeight != f.renderH ||
-                       in.outputWidth != f.outW || in.outputHeight != f.outH || in.preset != f.preset;
+                       in.outputWidth != f.outW || in.outputHeight != f.outH || in.preset != f.preset || in.rr != f.rr ||
+                       (in.rr && in.rrPreset != f.rrPreset);
     if (fresh && !CreateFeature(list, in, f, error)) {
         g_status = error;
         return false;
     }
+    if (in.rr) {
+        NVSDK_NGX_D3D12_DLSSD_Eval_Params dp = {};
+        dp.pInColor = in.color;
+        dp.pInOutput = in.output;
+        dp.pInDepth = in.depth;
+        dp.pInMotionVectors = in.motion;
+        dp.pInDiffuseAlbedo = in.diffuseAlbedo;
+        dp.pInSpecularAlbedo = in.specularAlbedo;
+        dp.pInNormals = in.normalRoughness;
+        dp.pInRoughness = in.normalRoughness;  // packed: read from the normals' w
+        dp.pInBiasCurrentColorMask = in.biasMask;
+        dp.InJitterOffsetX = in.jitterX;
+        dp.InJitterOffsetY = in.jitterY;
+        dp.InRenderSubrectDimensions = {in.renderWidth, in.renderHeight};
+        dp.InReset = in.reset || fresh ? 1 : 0;
+        dp.InMVScaleX = in.motionScaleX;
+        dp.InMVScaleY = in.motionScaleY;
+        dp.InPreExposure = 1.0f;
+        dp.InExposureScale = 1.0f;
+        // The parameter block keeps these pointers after the call, so they point at storage that
+        // lives on (Super Resolution clears them before its own evaluations).
+        static float worldToView[16], viewToClip[16];
+        memcpy(worldToView, in.worldToView, sizeof(worldToView));
+        memcpy(viewToClip, in.viewToClip, sizeof(viewToClip));
+        dp.pInWorldToViewMatrix = worldToView;
+        dp.pInViewToClipMatrix = viewToClip;
+        const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSSD_EXT(list, f.handle, g_params, &dp);
+        if (NVSDK_NGX_FAILED(r)) {
+            error = "Ray Reconstruction evaluation failed (" + ResultText(r) + ")";
+            g_status = error;
+            return false;
+        }
+        char buf[160];
+        snprintf(buf, sizeof(buf), "Ray Reconstruction running: %ux%u -> %ux%u, %s mode, RR preset %c", f.renderW,
+                 f.renderH, f.outW, f.outH, QualityName(f.quality), f.rrPreset > 0 ? static_cast<char>('A' + f.rrPreset - 1) : '-');
+        g_status = buf;
+        return true;
+    }
+    // Ray Reconstruction's camera matrices stay in the shared parameter block: Super Resolution reads
+    // them if present ("WorldToScreenMatrix not invertible" when they're stale), so clear them.
+    NVSDK_NGX_Parameter_SetVoidPointer(g_params, NVSDK_NGX_Parameter_DLSS_WORLD_TO_VIEW_MATRIX, nullptr);
+    NVSDK_NGX_Parameter_SetVoidPointer(g_params, NVSDK_NGX_Parameter_DLSS_VIEW_TO_CLIP_MATRIX, nullptr);
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
     ep.Feature.pInColor = in.color;
     ep.Feature.pInOutput = in.output;
