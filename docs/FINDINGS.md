@@ -108,3 +108,23 @@ those, so nothing is tagged); the game exited cleanly.
   motion vectors there would keep DLSS on those frames too.
 - DLSS quality label: Performance is created as "Quality" (first NGX mode whose range holds the
   render size); cosmetic, preset K is forced in every mode.
+
+## 1.2.0: DLSS Ray Reconstruction (2026-11-09)
+
+Ported whole from StrayDLSS 1.1.0 (forked from this add-on's 1.1.0; its upscaler differed only in
+accepting rgba16 velocity). Same design: the base pass's render targets give the G-buffer
+(GBufferA normal, GBufferB metallic/specular/roughness/shading model, GBufferC base colour),
+`src/guide.hlsl` turns it into diffuse albedo, specular albedo (EnvBRDFApprox) and normal +
+roughness, NGX DLSSD replaces Super Resolution at the TAA with View.TranslatedWorldToView (byte 192)
+and View.ViewToClipNoAA (512), and the game's six ray tracing denoisers (r.Shadow, r.Reflections,
+r.AmbientOcclusion, r.DiffuseIndirect, r.RayTracing.GlobalIllumination, r.RayTracing.SkyLight
+.Denoiser; all present in the 4.25 exe, game values 2/2/2/1/1/1) go to 0 on the game thread while
+it runs. Also brings Stray's DLSS model Automatic (ini key DlssModel; the old Preset key is no
+longer read).
+
+Test (2026-11-09, 4K HDR via TrueColorsTweaks, Quality, RT shadows High + reflections + AO, FSR
+Frame Generation 2x): base pass with 6 render targets, G-buffer 2564x1444 formats 24 / 87 / 91 (as
+Stray); View matrices passed (projection 1.0 / 1.7778); RR ran on every gameplay frame from about a
+second after DLSS started; denoisers off and back on with each toggle; no "WorldToScreenMatrix not
+invertible" after RR was switched off (Stray 1.1.0's fix holds); clean shutdown. 128x128 sets of
+six rgba16f targets (not a G-buffer) are logged and ignored. User: looks good.
