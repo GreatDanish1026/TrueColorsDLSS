@@ -128,3 +128,14 @@ Stray); View matrices passed (projection 1.0 / 1.7778); RR ran on every gameplay
 second after DLSS started; denoisers off and back on with each toggle; no "WorldToScreenMatrix not
 invertible" after RR was switched off (Stray 1.1.0's fix holds); clean shutdown. 128x128 sets of
 six rgba16f targets (not a G-buffer) are logged and ignored. User: looks good.
+
+## 1.2.1: render-size textures freed (2026-11-16)
+
+- **Bug** (found in StrayDLSS on 2026-11-16, same code here): our render-size textures (motion,
+  mask, composed colour, 3 Ray Reconstruction guides: 5 per size with RR on) were never freed and
+  capped at 16. After about four DLSS mode changes with RR on the next one was refused:
+  "motion: no texture (limit)" on every frame, the game's TAA took over silently and frame
+  generation paused.
+- 1.2.1 (port of StrayDLSS 1.2.1): textures unused for 8 presented frames are freed (with
+  their views) when room is needed; limit 32; the log says how many were freed. Built, not
+  yet run: to test, switch DLSS modes 4+ times and check the log for "no texture (limit)".

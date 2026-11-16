@@ -415,6 +415,7 @@ struct Link {
 std::map<uint64_t, Link> g_links;
 
 std::atomic<uint64_t> g_evaluated{0}, g_skipped{0};
+std::atomic<uint64_t> g_presents{0};  // presented frames (OnPresent)
 
 // Counts a view left to TSR, and logs each distinct reason the first few times.
 void Skip(const char* reason, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0) {
@@ -462,9 +463,13 @@ struct MotionState {
         format fmt = format::unknown;
         int slot = 0;
         resource tex = {0};
+        uint64_t lastUse = 0;  // g_presents when last handed out
     };
-    // rg16f motion, r8 masks (slot 0 from the motion pass, 1 with translucency) and rgba16f composed
-    // colour, one per size, kept until shutdown
+    // rg16f motion, r8 masks (slot 0 from the motion pass, 1 with translucency), rgba16f composed
+    // colour and the Ray Reconstruction guides, one per size. Sizes no longer used are freed when
+    // room is needed (MotionTexture); earlier versions kept them all and ran out after four render
+    // sizes with Ray Reconstruction on (5 textures each, limit 16): every frame then fell back to
+    // the game's TAA.
     std::vector<Texture> textures;
     // Debug tint of the masked pixels (tint.hlsl).
     pipeline_layout tintLayout = {0};
@@ -585,10 +590,36 @@ constexpr int kSlotDiffuse = 10, kSlotSpecular = 11, kSlotNormal = 12;
 
 // Our own render-resolution texture of <fmt> (rg16f motion vectors, r8 mask, rgba16f colour).
 resource MotionTexture(device* dev, uint32_t w, uint32_t h, format fmt = format::r16g16_float, int slot = 0) {
-    for (const MotionState::Texture& t : g_motion.textures)
-        if (t.width == w && t.height == h && t.fmt == fmt && t.slot == slot) return t.tex;
-    if (g_motion.textures.size() >= 16) return {0};
+    const uint64_t now = g_presents.load();
+    for (MotionState::Texture& t : g_motion.textures)
+        if (t.width == w && t.height == h && t.fmt == fmt && t.slot == slot) {
+            t.lastUse = now;
+            return t.tex;
+        }
+    constexpr size_t kMaxTextures = 32;
+    constexpr uint64_t kIdleFrames = 8;  // well past the frames the GPU may still have in flight
+    if (g_motion.textures.size() >= kMaxTextures) {
+        size_t freed = 0;
+        for (auto it = g_motion.textures.begin(); it != g_motion.textures.end();) {
+            if (now - it->lastUse < kIdleFrames) {
+                ++it;
+                continue;
+            }
+            for (int kind = 0; kind < 2; ++kind) {
+                auto v = g_motion.views.find(std::make_pair(it->tex.handle, kind));
+                if (v == g_motion.views.end()) continue;
+                dev->destroy_resource_view(v->second);
+                g_motion.views.erase(v);
+            }
+            dev->destroy_resource(it->tex);
+            it = g_motion.textures.erase(it);
+            ++freed;
+        }
+        Log("freed %zu textures of render sizes no longer used", freed);
+        if (g_motion.textures.size() >= kMaxTextures) return {0};
+    }
     MotionState::Texture t;
+    t.lastUse = now;
     t.width = w, t.height = h, t.fmt = fmt, t.slot = slot;
     const resource_desc d(w, h, 1, 1, fmt, 1, memory_heap::default_,
                           resource_usage::shader_resource | resource_usage::unordered_access);
@@ -861,7 +892,7 @@ bool Compose(command_list* cl, ListState& s) {
 // to be in a shader resource state by then (the lighting passes read it).
 
 std::string g_rrError;                     // why Ray Reconstruction isn't running (overlay)
-std::atomic<uint64_t> g_rrEvaluated{0}, g_rrLastPresent{0}, g_presents{0};
+std::atomic<uint64_t> g_rrEvaluated{0}, g_rrLastPresent{0};
 bool g_lastWasRr = false;
 
 bool Is8BitColor(format f) {
