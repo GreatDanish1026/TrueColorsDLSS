@@ -89,9 +89,13 @@ const char* QualityName(NVSDK_NGX_PerfQuality_Value q) {
 // The DLSS quality mode whose supported render size range holds the game's render size.
 NVSDK_NGX_PerfQuality_Value PickQuality(unsigned renderW, unsigned renderH, unsigned outW, unsigned outH) {
     if (renderW >= outW && renderH >= outH) return NVSDK_NGX_PerfQuality_Value_DLAA;
+    // The modes' supported ranges overlap, so take the mode whose optimal width is closest to the
+    // render width (first fit picked Quality at every scale).
     const NVSDK_NGX_PerfQuality_Value order[] = {
-        NVSDK_NGX_PerfQuality_Value_DLAA,    NVSDK_NGX_PerfQuality_Value_UltraQuality, NVSDK_NGX_PerfQuality_Value_MaxQuality,
-        NVSDK_NGX_PerfQuality_Value_Balanced, NVSDK_NGX_PerfQuality_Value_MaxPerf,      NVSDK_NGX_PerfQuality_Value_UltraPerformance};
+        NVSDK_NGX_PerfQuality_Value_UltraQuality, NVSDK_NGX_PerfQuality_Value_MaxQuality, NVSDK_NGX_PerfQuality_Value_Balanced,
+        NVSDK_NGX_PerfQuality_Value_MaxPerf,      NVSDK_NGX_PerfQuality_Value_UltraPerformance};
+    NVSDK_NGX_PerfQuality_Value best = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    unsigned bestDiff = UINT32_MAX;
     for (NVSDK_NGX_PerfQuality_Value q : order) {
         unsigned optW = 0, optH = 0, maxW = 0, maxH = 0, minW = 0, minH = 0;
         float sharp = 0;
@@ -99,9 +103,11 @@ NVSDK_NGX_PerfQuality_Value PickQuality(unsigned renderW, unsigned renderH, unsi
                                                            &sharp)) ||
             !optW)
             continue;
-        if (renderW >= minW && renderW <= maxW && renderH >= minH && renderH <= maxH) return q;
+        if (renderW < minW || renderW > maxW || renderH < minH || renderH > maxH) continue;
+        const unsigned diff = optW > renderW ? optW - renderW : renderW - optW;
+        if (diff < bestDiff) bestDiff = diff, best = q;
     }
-    return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    return best;
 }
 
 bool CreateFeature(ID3D12GraphicsCommandList* list, const Inputs& in, Feature& f, std::string& error) {

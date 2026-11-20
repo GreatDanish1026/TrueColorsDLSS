@@ -99,7 +99,17 @@ if ($Package) {
     Copy-Item "$root\third_party\fidelityfx\license.md" "$stage\licenses\AMD-FSR-LICENSE.txt"
     $zip = "$root\bin\release\$name.zip"
     if (Test-Path $zip) { Remove-Item -Force $zip }
-    Compress-Archive -Path "$stage\*" -DestinationPath $zip
+    # Zip with forward-slash entry names (Compress-Archive in PowerShell 5.1 writes backslashes,
+    # which some unzip tools mishandle: streamline\x.dll ended up as a file name).
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        Get-ChildItem $stage -Recurse -File | ForEach-Object {
+            $entry = $_.FullName.Substring($stage.Length + 1).Replace('\', '/')
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entry,
+                [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally { $archive.Dispose() }
     Write-Host "Packaged $zip"
     Get-ChildItem $stage -Recurse -File | ForEach-Object {
         "{0,-40} {1,-14} {2,12:N0}" -f $_.FullName.Substring($stage.Length + 1), $_.VersionInfo.FileVersion, $_.Length
